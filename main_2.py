@@ -417,19 +417,30 @@ import numpy as np
 from tkinter import Tk, filedialog
 from pdf2image import convert_from_path
 
-print("🚀 FINAL OCR PIPELINE (PRODUCTION VERSION) STARTING...")
+print("🚀 FINAL OCR PIPELINE (SMART VERSION) STARTING...")
 
 
-# ===== DYNAMIC SEGMENTATION =====
+# ===== PREPROCESSING =====
+def preprocess_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharp = cv2.filter2D(blur, -1, kernel)
+
+    return sharp
+
+
+# ===== CARD SEGMENTATION =====
 def segment_cards_dynamically(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
     _, binary = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
 
     horizontal_sum = np.sum(binary, axis=1)
 
     height, width = gray.shape
-    noise_threshold = width * 0.01  # FIXED sensitivity
+    noise_threshold = width * 0.01
 
     card_bounds = []
     start_y = None
@@ -454,16 +465,14 @@ def segment_cards_dynamically(image):
     return crops if crops else [image]
 
 
-# ===== IMPROVED EXTRACTION =====
+# ===== EXTRACTION =====
 def extract_card_details(ocr_results):
 
-    # FIXED sorting
     texts = [
         res[1].strip()
         for res in sorted(ocr_results, key=lambda x: min([p[1] for p in x[0]]))
     ]
 
-    # Clean labels
     clean_texts = [
         re.sub(r"^(Mob|Ph|Email|Add|Web|M|E|A|W):", "", t, flags=re.I).strip()
         for t in texts
@@ -477,61 +486,116 @@ def extract_card_details(ocr_results):
         "address": [],
     }
 
+    # ===== NAME DETECTION =====
+    job_words = [
+        "manager",
+        "developer",
+        "engineer",
+        "director",
+        "partner",
+        "consultant",
+        "founder",
+        "ceo",
+        "cto",
+        "analyst",
+        "lead",
+        "specialist",
+        "head",
+        "officer",
+        "executive",
+    ]
+
+    best_name = ""
+    fallback_name = ""
+
+    top_texts = clean_texts[:5]
+    remaining_texts = clean_texts[5:]
+
+    for t in top_texts + remaining_texts:
+        words = t.split()
+
+        if not (2 <= len(words) <= 4):
+            continue
+
+        if re.search(r"\d", t) or "@" in t:
+            continue
+
+        if any(j in t.lower() for j in job_words):
+            continue
+
+        if any(
+            k in t.lower() for k in ["ltd", "inc", "solutions", "consulting", "tech"]
+        ):
+            continue
+
+        if t.isupper():
+            best_name = t
+            break
+
+        elif all(w[0].isupper() for w in words if w):
+            if not fallback_name:
+                fallback_name = t
+
+    if best_name:
+        data["name"] = best_name
+    elif fallback_name:
+        data["name"] = fallback_name
+
+    # ===== OTHER FIELD EXTRACTION =====
+    company_keywords = [
+        "ltd",
+        "inc",
+        "solutions",
+        "consulting",
+        "studio",
+        "tech",
+        "group",
+        "company",
+    ]
+
     for t in clean_texts:
 
-        # ===== EMAIL (FIXED) =====
+        # EMAIL
         if "@" in t:
             cleaned = t.replace(" ", "").replace("com", ".com")
             data["email"] = cleaned.lower()
             continue
 
-        # ===== PHONE =====
-        if re.search(r"\d{10,}", t.replace(" ", "").replace("-", "")):
+        # PHONE
+        if re.search(r"(\+?\d[\d\s\-\(\)]{8,}\d)", t):
             data["phone"] = t
             continue
 
-        # ===== COMPANY (IMPROVED) =====
-        company_keywords = [
-            "ltd",
-            "inc",
-            "solutions",
-            "consulting",
-            "studio",
-            "tech",
-            "group",
-        ]
+        # COMPANY (SAFE + SMART)
+        if data["company"] == "N/A":
 
-        if any(k in t.lower() for k in company_keywords) or (
-            len(t.split()) >= 2 and data["company"] == "N/A"
-        ):
-            data["company"] = t
-            continue
+            if "@" in t or re.search(r"\d", t):
+                continue
 
-        # ===== ADDRESS (FIXED) =====
-        addr_keywords = [
-            "road",
-            "street",
-            "complex",
-            "floor",
-            "level",
-            "nagar",
-            "city",
-            "colony",
-            "block",
-        ]
+            if any(k in t.lower() for k in company_keywords):
+                data["company"] = t
+                continue
 
-        if any(k in t.lower() for k in addr_keywords) or re.search(r"\d{5,6}", t):
+            if len(t.split()) >= 2:
+                if not any(j in t.lower() for j in job_words):
+                    data["company"] = t
+
+        # ADDRESS
+        if any(
+            k in t.lower()
+            for k in [
+                "road",
+                "street",
+                "complex",
+                "floor",
+                "level",
+                "nagar",
+                "city",
+                "colony",
+                "block",
+            ]
+        ) or re.search(r"\d{5,6}", t):
             data["address"].append(t)
-            continue
-
-        # ===== NAME (FIXED) =====
-        if (
-            data["name"] == "Unknown"
-            and 2 <= len(t.split()) <= 3
-            and t.isupper()
-            and not re.search(r"\d", t)
-        ):
-            data["name"] = t
 
     return (
         data["name"],
@@ -565,7 +629,6 @@ def main():
     for path in file_paths:
         print(f"📁 Processing: {os.path.basename(path)}")
 
-        # ===== LOAD FILE =====
         if path.lower().endswith(".pdf"):
             pages = convert_from_path(path, poppler_path=r"C:\poppler\Library\bin")
             images = [cv2.cvtColor(np.array(p), cv2.COLOR_RGB2BGR) for p in pages]
@@ -574,16 +637,14 @@ def main():
 
         for p_idx, full_img in enumerate(images):
 
-            # ===== SEGMENT CARDS =====
             card_images = segment_cards_dynamically(full_img)
-            print(f"   Detected {len(card_images)} card(s) on Page {p_idx+1}")
+            print(f"   Detected {len(card_images)} card(s)")
 
             for c_idx, card_img in enumerate(card_images):
 
-                # ===== OCR =====
-                ocr_output = reader.readtext(card_img)
+                processed_img = preprocess_image(card_img)
+                ocr_output = reader.readtext(processed_img)
 
-                # ===== EXTRACTION =====
                 name, ph, mail, comp, addr = extract_card_details(ocr_output)
 
                 results_list.append(
@@ -598,10 +659,8 @@ def main():
                     }
                 )
 
-                # Debug image save
-                cv2.imwrite(f"output_debug/card_{p_idx}_{c_idx}.jpg", card_img)
+                cv2.imwrite(f"output_debug/card_{p_idx}_{c_idx}.jpg", processed_img)
 
-    # ===== SAVE OUTPUT =====
     df = pd.DataFrame(results_list)
 
     output_file = "Final_Visiting_Card_Data.xlsx"
