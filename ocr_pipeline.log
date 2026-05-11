@@ -1,0 +1,44 @@
+02:48:38 [INFO    ] ======================================================================
+02:48:38 [INFO    ]   VISITING CARD OCR EXTRACTOR — ULTIMATE BUILD v4.0
+02:48:38 [INFO    ] ======================================================================
+02:48:38 [INFO    ]   GPU: ENABLED (cuDNN benchmark active)
+02:48:42 [INFO    ]   1 file(s) selected.
+02:48:42 [INFO    ]   Loading EasyOCR model...
+02:48:44 [INFO    ]   EasyOCR ready.
+02:48:44 [INFO    ]   Poppler auto-detected: C:\poppler\Library\bin
+02:48:44 [INFO    ] 
+────────────────────────────────────────────────────────────
+02:48:44 [INFO    ]   File: Gemini_Generated_Image_85k0wz85k0wz85k0.png
+02:48:44 [INFO    ]   Segmented into 1 card(s).
+02:48:44 [INFO    ]   Card [P1_C1]
+02:48:44 [DEBUG   ]   Dark background detected — image inverted.
+02:48:44 [DEBUG   ]   Preprocessing: global contrast boost (σ=108.3)
+02:48:45 [DEBUG   ]   Raw OCR: 14 token(s)
+02:48:45 [DEBUG   ]     [0.68] 'URBANEDGE INFRA SOLUTIONS LLP'
+02:48:45 [DEBUG   ]     [0.92] 'A DITY A'
+02:48:45 [DEBUG   ]     [0.97] 'V .'
+02:48:45 [DEBUG   ]     [0.73] 'VA R M A'
+02:48:45 [DEBUG   ]     [0.63] 'ARCHITECT & FOUND ER'
+02:48:45 [DEBUG   ]     [0.70] 'P RIN CIPA L'
+02:48:45 [DEBUG   ]     [0.61] 'URBA NED GE 50LUTIONS LLP'
+02:48:45 [DEBUG   ]     [0.77] '+91 (261) 2200-112'
+02:48:45 [DEBUG   ]     [1.00] 'urbanedgeninfra'
+02:48:45 [DEBUG   ]     [0.94] 'C0'
+02:48:45 [DEBUG   ]     [0.99] 'in'
+02:48:45 [DEBUG   ]     [0.90] 'aditya.V'
+02:48:45 [DEBUG   ]     [0.76] '8th Floor, SkyTower Complex'
+02:48:45 [DEBUG   ]     [1.00] 'Surt 395007'
+02:48:45 [DEBUG   ]   [FIX-4] PIN 395007 → expected city 'Surat'
+02:48:47 [DEBUG   ]   Card height: 724px | Name zone ≤ 471px
+02:48:47 [DEBUG   ]   Phone: '+91 (261) 2200-112' → '+912612200112' (0.77)
+02:48:47 [DEBUG   ]   Name via [zone_caps]: 'V .' (0.97)
+02:48:47 [DEBUG   ]   Company assembled: 'URBANEDGE INFRA SOLUTIONS LLP' (0.68)
+02:48:47 [INFO    ]   Name: 'V .'                  Phone: +912612200112      Email: N/A                                 Company: 'URBANEDGE INFRA SOLUTIONS LLP' Quality: YELLOW
+02:48:47 [INFO    ]   Excel saved → C:\Users\Pray\Projects\Visiting_Card_Extractor\Visiting_Card_Data_ULTIMATE.xlsx
+02:48:47 [INFO    ] 
+======================================================================
+02:48:47 [INFO    ]   COMPLETE — 1 card(s) processed, 0 failed.
+02:48:47 [INFO    ]   Quality → GREEN: 0 | YELLOW: 1 | RED: 0
+02:48:47 [INFO    ]   Output  : C:\Users\Pray\Projects\Visiting_Card_Extractor\Visiting_Card_Data_ULTIMATE.xlsx
+02:48:47 [INFO    ]   Log     : C:\Users\Pray\Projects\Visiting_Card_Extractor\ocr_pipeline.log
+02:48:47 [INFO    ] ======================================================================
