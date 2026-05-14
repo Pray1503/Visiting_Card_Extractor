@@ -1,1754 +1,1936 @@
+# #!/usr/bin/env python3
+# """
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║           VISITING CARD OCR EXTRACTOR  v5.0  —  FINAL EDITION              ║
+# ║                                                                              ║
+# ║  ► No hardcoded countries, cities, or regions — works on ANY card globally  ║
+# ║  ► Multi-engine: EasyOCR  +  Tesseract fallback for maximum coverage        ║
+# ║  ► Full deskew pipeline  — handles tilted / rotated cards                   ║
+# ║  ► CLAHE + adaptive preprocessing — works on dark, light, and grey cards    ║
+# ║  ► Triple-pass OCR — normal, brightened, darkened — catches all text tones  ║
+# ║  ► Fuzzy reconstruction  — handles spaced letters, OCR artefacts            ║
+# ║  ► Auto Y-tolerance — adapts to font size, no manual tuning needed          ║
+# ║  ► Exports JSON + CSV per run                                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# REQUIREMENTS  (install once):
+#     pip install easyocr opencv-python-headless numpy pillow pytesseract
+
+#     pytesseract also needs the Tesseract binary:
+#         Windows : https://github.com/UB-Mannheim/tesseract/wiki
+#         Linux   : sudo apt install tesseract-ocr
+#         macOS   : brew install tesseract
+
+# USAGE:
+#     python visiting_card_ocr.py                  # GUI file picker (single image)
+#     python visiting_card_ocr.py path/to/img.jpg  # CLI single image
+#     python visiting_card_ocr.py path/to/folder/  # CLI batch — all images in folder
+#     python visiting_card_ocr.py img.jpg --debug  # also save debug images
+# """
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  IMPORTS
+# # ══════════════════════════════════════════════════════════════════════════════
+# import os
+# import re
+# import sys
+# import csv
+# import json
+# import math
+# import warnings
+# import argparse
+# import unicodedata
+# from pathlib import Path
+# from datetime import datetime
+
+# import cv2
+# import numpy as np
+# from PIL import Image
+
+# # ── Optional imports handled gracefully ───────────────────────────────────────
+# try:
+#     import easyocr
+
+#     EASYOCR_AVAILABLE = True
+# except ImportError:
+#     EASYOCR_AVAILABLE = False
+#     print("  [WARN] easyocr not installed — pip install easyocr")
+
+# try:
+#     import pytesseract
+
+#     TESSERACT_AVAILABLE = True
+# except ImportError:
+#     TESSERACT_AVAILABLE = False
+#     print("  [WARN] pytesseract not installed — pip install pytesseract")
+
+# try:
+#     import torch
+
+#     GPU_AVAILABLE = torch.cuda.is_available()
+# except ImportError:
+#     GPU_AVAILABLE = False
+
+# warnings.filterwarnings("ignore")
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  TUNEABLE CONSTANTS
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# # Preprocessing
+# DARK_BG_THRESHOLD = 128  # centre-pixel mean below this → dark card
+# DARK_PIXEL_RATIO = 0.50  # fraction of centre pixels below threshold
+# RESIZE_MAX_SIDE = 2200  # upscale to this; EasyOCR hates tiny images
+# RESIZE_MIN_SIDE = 900  # downscale huge images to save RAM
+# CLAHE_CLIP = 2.5
+# CLAHE_TILE = (8, 8)
+# UNSHARP_AMOUNT = 0.55
+# STD_DEV_ADAPTIVE = 42  # σ below this → use adaptive threshold
+
+# # OCR
+# OCR_CONF_THRESHOLD = 0.28  # lower than default to catch faint grey text
+# OCR_WIDTH_THS = 0.75
+# OCR_DECODER = "greedy"
+
+# # Line grouping
+# LINE_Y_BASE_TOL = 28  # pixels; auto-scaled by median font height
+
+# # Phone digit count validation (international)
+# PHONE_MIN_DIGITS = 6
+# PHONE_MAX_DIGITS = 15
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  COMPILED REGEX
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# _TLD = (
+#     r"(?:com|in|org|net|co\.in|co\.uk|io|biz|info|edu|gov|"
+#     r"ae|us|au|nz|sg|hk|my|ph|za|de|fr|jp|cn|ca|br|mx|"
+#     r"co\.ae|co\.sg|co\.za|co\.au|co\.nz|co\.jp|co\.ca|"
+#     r"tech|app|dev|ai)"
+# )
+
+# # Email — allows OCR-inserted spaces around @ and .
+# _EMAIL_RE = re.compile(
+#     r"[A-Za-z0-9._%+\-]+\s*@\s*[A-Za-z0-9.\-]+\s*\.\s*" + _TLD,
+#     re.IGNORECASE,
+# )
+
+# # Website
+# _WEB_RE = re.compile(
+#     r"(?:https?://|www\.)[A-Za-z0-9.\-/_%?=&#]+"
+#     r"|[A-Za-z0-9\-]+\.(?:com|in|org|net|io|co\.in|co\.uk|biz)[/\w\-]*",
+#     re.IGNORECASE,
+# )
+
+# # Phone — liberal; digit-count validated afterwards
+# _PHONE_RE = re.compile(
+#     r"(?:\+\s*\d{1,4}[\s\-\.]*)?"
+#     r"(?:\([\d\s]+\)[\s\-\.]*)?"
+#     r"[\d][\d\s\-\.]{4,18}[\d]",
+# )
+
+# # LinkedIn / Twitter
+# _LINKEDIN_RE = re.compile(r"linkedin\.com/in/[A-Za-z0-9_\-]+", re.IGNORECASE)
+# _TWITTER_RE = re.compile(
+#     r"(?:twitter\.com/|x\.com/|@)[A-Za-z0-9_]{2,50}", re.IGNORECASE
+# )
+
+# # Job title keywords — purely structural, no country assumption
+# _TITLE_KW = re.compile(
+#     r"\b(?:manager|director|engineer|developer|architect|founder|partner|"
+#     r"consultant|analyst|officer|executive|president|associate|senior|"
+#     r"junior|principal|head|lead|specialist|advisor|coordinator|"
+#     r"supervisor|assistant|proprietor|owner|chairman|trustee|secretary|"
+#     r"treasurer|intern|trainee|ceo|cto|coo|cfo|cmo|md|vp|"
+#     r"vice\s*president|doctor|dr\.?|prof\.?|professor|lawyer|advocate|"
+#     r"solicitor|barrister|accountant|auditor|designer|strategist|"
+#     r"planner|researcher|scientist|technician|operator|representative|"
+#     r"agent|broker|dealer|trader|contractor|builder)\b",
+#     re.IGNORECASE,
+# )
+
+# # Company / org keywords
+# _COMPANY_KW = re.compile(
+#     r"\b(?:ltd|limited|inc|llp|llc|pvt|private|plc|corp|corporation|"
+#     r"solutions|consulting|studio|technologies|tech|group|company|co\.|"
+#     r"labs|services|systems|enterprises|associates|builders|construction|"
+#     r"industries|global|international|ventures|holdings|capital|networks|"
+#     r"media|digital|infra|infrastructure|realty|realtors|properties|"
+#     r"developers|architects|interiors|design|agency|firm|bureau|office|"
+#     r"foundation|trust|institute|academy|school|college|hospital|clinic|"
+#     r"healthcare|pharma|logistics|transport|exports|imports|trading|"
+#     r"manufacturing|fabrication|engineering)\b",
+#     re.IGNORECASE,
+# )
+
+# # Address structural cues — works globally without any city list
+# _ADDR_KW = re.compile(
+#     r"\b(?:floor|fl\.|level|suite|no\.|plot|block|sector|phase|unit|"
+#     r"road|rd\.|street|st\.|avenue|ave\.|lane|ln\.|boulevard|blvd\.|"
+#     r"nagar|vihar|marg|gali|chowk|bazaar|market|colony|society|"
+#     r"residency|plaza|centre|center|mall|complex|tower|building|"
+#     r"district|area|zone|suburb|village|town|city|state|province|"
+#     r"county|region|po\s*box|p\.o\.|zip|pin)\b",
+#     re.IGNORECASE,
+# )
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  BBOX HELPERS
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def mid_y(bbox) -> float:
+#     return (bbox[0][1] + bbox[2][1]) / 2.0
+
+
+# def top_y(bbox) -> float:
+#     return float(bbox[0][1])
+
+
+# def left_x(bbox) -> float:
+#     return float(bbox[0][0])
+
+
+# def height_px(bbox) -> float:
+#     return float(bbox[2][1] - bbox[0][1])
+
+
+# def width_px(bbox) -> float:
+#     return float(bbox[1][0] - bbox[0][0])
+
+
+# def _bbox_key(bbox) -> str:
+#     """Coarse grid key for deduplication across OCR engines."""
+#     return f"{int(left_x(bbox)//14)},{int(top_y(bbox)//14)}"
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 1 — IMAGE LOADING
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def load_image(path: str) -> np.ndarray:
+#     img = cv2.imread(path)
+#     if img is None:
+#         try:
+#             pil = Image.open(path).convert("RGB")
+#             img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+#         except Exception as e:
+#             raise ValueError(f"Cannot open image: {path}\n{e}")
+#     return img
+
+
+# def resize_for_ocr(img: np.ndarray) -> np.ndarray:
+#     h, w = img.shape[:2]
+#     max_s = max(h, w)
+#     min_s = min(h, w)
+#     if max_s < RESIZE_MIN_SIDE:
+#         scale = RESIZE_MIN_SIDE / min_s
+#     elif max_s > RESIZE_MAX_SIDE:
+#         scale = RESIZE_MAX_SIDE / max_s
+#     else:
+#         scale = 1.0
+#     if abs(scale - 1.0) > 0.02:
+#         interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+#         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=interp)
+#     return img
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 2 — DESKEW
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def deskew(img: np.ndarray) -> tuple:
+#     """
+#     Detect and correct card tilt using Hough lines on Canny edges.
+#     Returns (corrected_image, angle_degrees).
+#     Safe: returns original image unchanged if tilt < 0.5° or detection fails.
+#     """
+#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+#     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+#     otsu_t, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+#     edges = cv2.Canny(blur, otsu_t * 0.5, otsu_t)
+
+#     lines = cv2.HoughLinesP(
+#         edges, 1, math.pi / 180, threshold=80, minLineLength=60, maxLineGap=20
+#     )
+#     if lines is None or len(lines) < 3:
+#         return img, 0.0
+
+#     angles = []
+#     for line in lines:
+#         x1, y1, x2, y2 = line[0]
+#         a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+#         if abs(a) < 45:
+#             angles.append(a)
+
+#     if not angles:
+#         return img, 0.0
+
+#     angle = float(np.median(angles))
+#     if abs(angle) < 0.5:
+#         return img, 0.0
+
+#     h, w = img.shape[:2]
+#     cx, cy = w // 2, h // 2
+#     M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+#     cos_a = abs(M[0, 0])
+#     sin_a = abs(M[0, 1])
+#     nw = int(h * sin_a + w * cos_a)
+#     nh = int(h * cos_a + w * sin_a)
+#     M[0, 2] += (nw - w) / 2
+#     M[1, 2] += (nh - h) / 2
+#     rotated = cv2.warpAffine(
+#         img, M, (nw, nh), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+#     )
+#     return rotated, angle
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 3 — PREPROCESSING
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def _detect_dark_bg(gray: np.ndarray) -> bool:
+#     h, w = gray.shape
+#     y1, y2 = int(h * 0.30), int(h * 0.70)
+#     x1, x2 = int(w * 0.30), int(w * 0.70)
+#     c = gray[y1:y2, x1:x2]
+#     return (
+#         float(np.mean(c)) < DARK_BG_THRESHOLD
+#         and float(np.sum(c < DARK_BG_THRESHOLD)) / c.size > DARK_PIXEL_RATIO
+#     )
+
+
+# def preprocess_image(img: np.ndarray) -> tuple:
+#     """
+#     Returns (processed_gray, is_dark, mode_string).
+
+#     Pipeline:
+#       1. Greyscale
+#       2. Invert if dark background (text → dark on white)
+#       3. CLAHE — local contrast, does NOT over-expose faint grey text
+#       4. Unsharp mask — sharpens text edges
+#       5. Low σ → adaptive threshold; else keep greyscale
+#     """
+#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+#     is_dark = _detect_dark_bg(gray)
+
+#     if is_dark:
+#         gray = cv2.bitwise_not(gray)
+
+#     clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+#     gray = clahe.apply(gray)
+
+#     # Unsharp mask
+#     blur = cv2.GaussianBlur(gray, (0, 0), 3)
+#     gray = cv2.addWeighted(gray, 1 + UNSHARP_AMOUNT, blur, -UNSHARP_AMOUNT, 0)
+
+#     std = float(np.std(gray))
+
+#     if std < STD_DEV_ADAPTIVE:
+#         mode = f"ADAPTIVE THRESHOLD (σ={std:.1f})"
+#         gray = cv2.adaptiveThreshold(
+#             gray,
+#             255,
+#             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+#             cv2.THRESH_BINARY,
+#             blockSize=21,
+#             C=10,
+#         )
+#     else:
+#         mode = f"CLAHE+UNSHARP (σ={std:.1f}, dark={is_dark})"
+
+#     return gray, is_dark, mode
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 4 — OCR ENGINES
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# _EASYOCR_READER = None
+
+
+# def _get_reader():
+#     global _EASYOCR_READER
+#     if _EASYOCR_READER is None and EASYOCR_AVAILABLE:
+#         _EASYOCR_READER = easyocr.Reader(["en"], gpu=GPU_AVAILABLE, verbose=False)
+#     return _EASYOCR_READER
+
+
+# def run_easyocr(processed: np.ndarray) -> list:
+#     """
+#     Triple-pass EasyOCR:
+#       Pass 1 — image as-is          (normal contrast)
+#       Pass 2 — brightened +30       (catches dark/faint text)
+#       Pass 3 — darkened  -25        (catches light-on-slightly-grey backgrounds)
+#     All three results are merged; highest-confidence token wins per grid cell.
+#     """
+#     reader = _get_reader()
+#     if reader is None:
+#         return []
+
+#     pool = {}
+
+#     def _pass(arr):
+#         for bbox, text, conf in reader.readtext(
+#             arr, width_ths=OCR_WIDTH_THS, decoder=OCR_DECODER, paragraph=False
+#         ):
+#             k = _bbox_key(bbox)
+#             if k not in pool or conf > pool[k][2]:
+#                 pool[k] = (bbox, text, conf)
+
+#     _pass(processed)
+#     _pass(cv2.convertScaleAbs(processed, alpha=1.35, beta=25))
+#     _pass(cv2.convertScaleAbs(processed, alpha=0.72, beta=-15))
+
+#     return list(pool.values())
+
+
+# def run_tesseract(processed: np.ndarray) -> list:
+#     """
+#     Tesseract supplement — PSM 6 (block), 11 (sparse), 3 (auto).
+#     Uses the same (bbox, text, conf) structure as EasyOCR for unified handling.
+#     """
+#     if not TESSERACT_AVAILABLE:
+#         return []
+
+#     pil = Image.fromarray(processed)
+#     pool = {}
+
+#     for psm in [6, 11, 3]:
+#         try:
+#             data = pytesseract.image_to_data(
+#                 pil,
+#                 config=f"--psm {psm} --oem 3",
+#                 output_type=pytesseract.Output.DICT,
+#             )
+#         except Exception:
+#             continue
+
+#         for i in range(len(data["text"])):
+#             text = data["text"][i].strip()
+#             if not text:
+#                 continue
+#             raw_conf = data["conf"][i]
+#             if isinstance(raw_conf, str):
+#                 raw_conf = (
+#                     float(raw_conf) if raw_conf.strip() not in ("-1", "") else 0.0
+#                 )
+#             conf = max(0.0, float(raw_conf) / 100.0)
+
+#             x, y, w, h = (
+#                 data["left"][i],
+#                 data["top"][i],
+#                 data["width"][i],
+#                 data["height"][i],
+#             )
+#             if w < 4 or h < 4:
+#                 continue
+
+#             bbox = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+#             k = _bbox_key(bbox)
+#             if k not in pool or conf > pool[k][2]:
+#                 pool[k] = (bbox, text, conf)
+
+#     return list(pool.values())
+
+
+# def merge_ocr(easy: list, tess: list) -> list:
+#     merged = {}
+#     for bbox, text, conf in easy + tess:
+#         k = _bbox_key(bbox)
+#         if k not in merged or conf > merged[k][2]:
+#             merged[k] = (bbox, text, conf)
+#     return list(merged.values())
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 5 — TOKEN CLEANING
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def collapse_spaced(text: str) -> str:
+#     """'A D I T Y A'  →  'ADITYA'  |  'V A R M A'  →  'VARMA'"""
+#     segs = text.strip().split()
+#     if len(segs) >= 2 and all(re.fullmatch(r"[A-Za-z]\.?", s) for s in segs):
+#         return "".join(segs)
+#     return text
+
+
+# _DIGIT_MAP = str.maketrans(
+#     {
+#         "O": "0",
+#         "o": "0",
+#         "I": "1",
+#         "l": "1",
+#         "S": "5",
+#         "s": "5",
+#         "B": "8",
+#         "G": "6",
+#         "g": "9",
+#         "Z": "2",
+#         "z": "2",
+#     }
+# )
+
+
+# def fix_digits(text: str) -> str:
+#     return text.translate(_DIGIT_MAP)
+
+
+# def clean_text(text: str) -> str:
+#     text = unicodedata.normalize("NFKC", text)
+#     text = re.sub(r" {2,}", " ", text).strip()
+#     return text
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 6 — LINE GROUPING
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def group_lines(tokens: list) -> list:
+#     """
+#     Sort by Y then X; group tokens whose mid-Y values are within a dynamic
+#     tolerance (based on median font height) into the same line.
+#     """
+#     if not tokens:
+#         return []
+
+#     heights = [height_px(b) for b, _, _ in tokens]
+#     med_h = float(np.median(heights)) if heights else 20
+#     y_tol = max(LINE_Y_BASE_TOL, int(med_h * 0.65))
+
+#     sorted_t = sorted(tokens, key=lambda r: (mid_y(r[0]), left_x(r[0])))
+
+#     lines = []
+#     current = [sorted_t[0]]
+
+#     for item in sorted_t[1:]:
+#         if abs(mid_y(item[0]) - mid_y(current[0][0])) <= y_tol:
+#             current.append(item)
+#         else:
+#             lines.append(sorted(current, key=lambda r: left_x(r[0])))
+#             current = [item]
+#     lines.append(sorted(current, key=lambda r: left_x(r[0])))
+#     return lines
+
+
+# def line_text(line: list, sep: str = " ") -> str:
+#     parts = [collapse_spaced(clean_text(t)) for _, t, _ in line if t.strip()]
+#     return sep.join(p for p in parts if p)
+
+
+# def line_conf(line: list) -> float:
+#     return sum(c for _, _, c in line) / len(line) if line else 0.0
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 7 — FIELD EXTRACTION
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# # ── Email ─────────────────────────────────────────────────────────────────────
+
+
+# def extract_email(lines: list) -> str:
+#     hits = []
+#     for line in lines:
+#         # Full joined line (no spaces)
+#         full = re.sub(r"\s+", "", line_text(line))
+#         m = _EMAIL_RE.search(full)
+#         if m:
+#             hits.append((line_conf(line), re.sub(r"\s+", "", m.group()).lower()))
+#         # Per-token
+#         for _, t, c in line:
+#             t2 = re.sub(r"\s+", "", t)
+#             m2 = _EMAIL_RE.search(t2)
+#             if m2:
+#                 hits.append((c, re.sub(r"\s+", "", m2.group()).lower()))
+#     return max(hits, key=lambda x: x[0])[1] if hits else ""
+
+
+# # ── Phones ────────────────────────────────────────────────────────────────────
+
+
+# def extract_phones(lines: list) -> list:
+#     found = []
+#     for line in lines:
+#         txt = fix_digits(line_text(line))
+#         for m in _PHONE_RE.finditer(txt):
+#             raw = m.group()
+#             digits = re.sub(r"\D", "", raw)
+#             if PHONE_MIN_DIGITS <= len(digits) <= PHONE_MAX_DIGITS:
+#                 # Normalise: collapse single-digit-spaces like '2 2 0 0' → '2200'
+#                 norm = re.sub(r"(?<=\d) (?=\d)", "", raw)
+#                 norm = re.sub(r"\s{2,}", " ", norm).strip()
+#                 if norm and norm not in found:
+#                     found.append(norm)
+#     return found
+
+
+# # ── Website ───────────────────────────────────────────────────────────────────
+
+
+# def extract_website(lines: list) -> str:
+#     for line in lines:
+#         m = _WEB_RE.search(line_text(line))
+#         if m:
+#             url = m.group().strip()
+#             return ("http://" + url if not url.startswith("http") else url).lower()
+#     return ""
+
+
+# # ── Name ─────────────────────────────────────────────────────────────────────
+
+
+# def extract_name(lines: list, raw_tokens: list) -> str:
+#     """
+#     Name extraction — purely structural, no hardcoded names or locations:
+
+#     1. Reject tokens with digits, @, company/job/address keywords, <60% alpha.
+#     2. From survivors, group into lines.
+#     3. Score each line: font_height × confidence × vertical_position_bonus.
+#     4. Pick the highest-scoring line.
+#     5. Title-case if all-caps.
+#     """
+#     if not raw_tokens:
+#         return ""
+
+#     all_bottom_y = [top_y(b) + height_px(b) for b, _, _ in raw_tokens]
+#     card_h = max(all_bottom_y) if all_bottom_y else 1
+
+#     def _ok(bbox, text, conf):
+#         if conf < OCR_CONF_THRESHOLD:
+#             return False
+#         t = text.strip()
+#         if len(t) < 2:
+#             return False
+#         if re.search(r"\d", t) or "@" in t:
+#             return False
+#         if _COMPANY_KW.search(t) or _TITLE_KW.search(t) or _ADDR_KW.search(t):
+#             return False
+#         alpha_r = sum(c.isalpha() for c in t) / max(len(t), 1)
+#         if alpha_r < 0.60:
+#             return False
+#         return True
+
+#     cands = [(b, t, c) for b, t, c in raw_tokens if _ok(b, t, c)]
+#     if not cands:
+#         return ""
+
+#     cand_lines = group_lines(cands)
+
+#     def _score(ln):
+#         avg_h = float(np.mean([height_px(b) for b, _, _ in ln]))
+#         avg_c = line_conf(ln)
+#         avg_y = float(np.mean([top_y(b) for b, _, _ in ln]))
+#         pos_b = 1.0 - (avg_y / card_h)
+#         return avg_h * avg_c * (1 + 0.35 * pos_b)
+
+#     best = max(cand_lines, key=_score)
+#     parts = []
+#     for _, t, _ in sorted(best, key=lambda r: left_x(r[0])):
+#         p = collapse_spaced(clean_text(t))
+#         if p.isupper() and len(p) > 2:
+#             p = p.title()
+#         parts.append(p)
+
+#     name = " ".join(parts)
+#     name = re.sub(r"^[^A-Za-z]+|[^A-Za-z.'\-]+$", "", name).strip()
+#     return name
+
+
+# # ── Company ───────────────────────────────────────────────────────────────────
+
+
+# def extract_company(lines: list) -> str:
+#     scored = []
+#     for line in lines:
+#         t = line_text(line).strip()
+#         if not t:
+#             continue
+#         score = 0
+#         if _COMPANY_KW.search(t):
+#             score += 10
+#         if t.isupper() and len(t.split()) >= 2:
+#             score += 3
+#         if len(t.split()) >= 2:
+#             score += 1
+#         if "@" in t or re.search(r"\d{4,}", t):
+#             score -= 10
+#         if _ADDR_KW.search(t):
+#             score -= 5
+#         if _TITLE_KW.search(t):
+#             score -= 4
+#         if score > 0:
+#             scored.append((score, line_conf(line), t))
+
+#     if not scored:
+#         return ""
+#     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+#     return scored[0][2]
+
+
+# # ── Job title ─────────────────────────────────────────────────────────────────
+
+
+# def extract_job_title(lines: list) -> str:
+#     for line in lines:
+#         t = line_text(line).strip()
+#         if _TITLE_KW.search(t) and not _COMPANY_KW.search(t):
+#             return t
+#     return ""
+
+
+# # ── Address ───────────────────────────────────────────────────────────────────
+
+
+# def extract_address(lines: list) -> str:
+#     """
+#     Detect address fragments using ONLY structural cues (floor/road/complex
+#     keywords and standalone pincodes).  Zero hardcoded city / country names.
+#     Works globally.
+#     """
+#     parts = []
+#     for line in lines:
+#         t = line_text(line).strip()
+#         if not t:
+#             continue
+#         is_addr = False
+#         if _ADDR_KW.search(t):
+#             is_addr = True
+#         # Standalone numeric block that looks like a pincode / ZIP
+#         if re.search(r"\b\d{4,9}\b", t) and not re.search(r"[+\-]\s*\d{6,}", t):
+#             is_addr = True
+#         # "Something, Something" with initial caps — city/country pattern
+#         if re.search(r"[A-Z][a-z]+,\s*[A-Z][a-z]+", t):
+#             is_addr = True
+#         if is_addr:
+#             parts.append(t)
+#     return ", ".join(parts) if parts else ""
+
+
+# # ── Social ────────────────────────────────────────────────────────────────────
+
+
+# def extract_social(lines: list) -> dict:
+#     r = {"linkedin": "", "twitter": ""}
+#     for line in lines:
+#         t = line_text(line)
+#         if not r["linkedin"]:
+#             m = _LINKEDIN_RE.search(t)
+#             if m:
+#                 r["linkedin"] = m.group().strip()
+#         if not r["twitter"]:
+#             m = _TWITTER_RE.search(t)
+#             if m:
+#                 r["twitter"] = m.group().strip()
+#     return r
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 8 — FULL PIPELINE
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def process_card(image_path: str, debug: bool = False) -> dict:
+#     result = {
+#         "file": os.path.basename(image_path),
+#         "name": "",
+#         "job_title": "",
+#         "company": "",
+#         "email": "",
+#         "phones": [],
+#         "website": "",
+#         "address": "",
+#         "linkedin": "",
+#         "twitter": "",
+#         "_debug": {},
+#     }
+
+#     # 1. Load + resize
+#     img = load_image(image_path)
+#     img = resize_for_ocr(img)
+
+#     # 2. Deskew
+#     img, skew = deskew(img)
+
+#     # 3. Preprocess
+#     proc, is_dark, mode = preprocess_image(img)
+
+#     if debug:
+#         result["_debug"].update({"skew": round(skew, 2), "dark": is_dark, "mode": mode})
+#         d = os.path.dirname(os.path.abspath(image_path))
+#         cv2.imwrite(os.path.join(d, "DEBUG_preprocessed_v5.png"), proc)
+
+#     # 4. OCR (EasyOCR + Tesseract merged)
+#     easy = run_easyocr(proc)
+#     tess = run_tesseract(proc)
+#     tokens = merge_ocr(easy, tess)
+#     kept = [(b, t, c) for b, t, c in tokens if c >= OCR_CONF_THRESHOLD]
+
+#     if debug:
+#         result["_debug"]["total"] = len(tokens)
+#         result["_debug"]["kept"] = len(kept)
+#         result["_debug"]["raw"] = [
+#             {"text": t, "conf": round(c, 3), "y": round(top_y(b), 1)}
+#             for b, t, c in sorted(tokens, key=lambda r: top_y(r[0]))
+#         ]
+
+#     # 5. Line grouping
+#     lines = group_lines(kept)
+
+#     if debug:
+#         result["_debug"]["lines"] = [
+#             {"n": i + 1, "text": line_text(ln), "conf": round(line_conf(ln), 3)}
+#             for i, ln in enumerate(lines)
+#         ]
+
+#     # 6. Extract fields
+#     result["email"] = extract_email(lines)
+#     result["phones"] = extract_phones(lines)
+#     result["website"] = extract_website(lines)
+#     result["name"] = extract_name(lines, kept)
+#     result["company"] = extract_company(lines)
+#     result["job_title"] = extract_job_title(lines)
+#     result["address"] = extract_address(lines)
+#     soc = extract_social(lines)
+#     result["linkedin"] = soc["linkedin"]
+#     result["twitter"] = soc["twitter"]
+
+#     # 7. Debug annotation
+#     if debug:
+#         _annotate(img, tokens, image_path)
+
+#     return result
+
+
+# def _annotate(img: np.ndarray, tokens: list, src: str):
+#     ann = img.copy()
+#     for bbox, text, conf in tokens:
+#         pts = np.array([[int(p[0]), int(p[1])] for p in bbox], np.int32)
+#         color = (0, 200, 0) if conf >= OCR_CONF_THRESHOLD else (0, 0, 200)
+#         cv2.polylines(ann, [pts], True, color, 2)
+#         label = f"{text[:24]}{'…' if len(text)>24 else ''} [{conf:.2f}]"
+#         pos = (max(pts[0][0], 0), max(pts[0][1] - 5, 12))
+#         (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+#         cv2.rectangle(
+#             ann, (pos[0], pos[1] - lh - 2), (pos[0] + lw, pos[1] + 2), (20, 20, 20), -1
+#         )
+#         cv2.putText(
+#             ann, label, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA
+#         )
+#     out = os.path.join(os.path.dirname(os.path.abspath(src)), "DEBUG_annotated_v5.png")
+#     cv2.imwrite(out, ann)
+#     print(f"  [DEBUG] Annotated → {out}")
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  STEP 9 — OUTPUT
+# # ══════════════════════════════════════════════════════════════════════════════
+
+
+# def print_result(r: dict):
+#     w = 60
+#     print()
+#     print("═" * w)
+#     print(f"  FILE      : {r['file']}")
+#     print("─" * w)
+#     print(f"  NAME      : {r['name']      or '—'}")
+#     print(f"  JOB TITLE : {r['job_title'] or '—'}")
+#     print(f"  COMPANY   : {r['company']   or '—'}")
+#     print(f"  EMAIL     : {r['email']     or '—'}")
+#     for i, ph in enumerate(r["phones"], 1):
+#         label = f"  PHONE {'#'+str(i):<4}"
+#         print(f"{label}: {ph}")
+#     if not r["phones"]:
+#         print(f"  PHONE     : —")
+#     print(f"  WEBSITE   : {r['website']   or '—'}")
+#     print(f"  ADDRESS   : {r['address']   or '—'}")
+#     print(f"  LINKEDIN  : {r['linkedin']  or '—'}")
+#     print(f"  TWITTER/X : {r['twitter']   or '—'}")
+#     print("═" * w)
+
+#     if r.get("_debug"):
+#         print(
+#             f"\n  [DEBUG] skew={r['_debug'].get('skew')}°  "
+#             f"dark={r['_debug'].get('dark')}  "
+#             f"mode={r['_debug'].get('mode')}"
+#         )
+#         print(
+#             f"  [DEBUG] tokens total={r['_debug'].get('total')}  "
+#             f"kept={r['_debug'].get('kept')}"
+#         )
+#         print()
+#         print("  RAW TOKENS:")
+#         for tk in r["_debug"].get("raw", []):
+#             mark = "  " if tk["conf"] >= OCR_CONF_THRESHOLD else "✗ "
+#             print(f"  {mark}y={tk['y']:>6.1f}  conf={tk['conf']:.3f}  {tk['text']!r}")
+#         print()
+#         print("  GROUPED LINES:")
+#         for ln in r["_debug"].get("lines", []):
+#             print(f"  Line {ln['n']:02d} (conf={ln['conf']:.2f}) : {ln['text']!r}")
+#         print()
+
+
+# def _ts() -> str:
+#     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# def save_json(results: list, out_dir: str):
+#     path = os.path.join(out_dir, f"cards_{_ts()}.json")
+#     clean = [{k: v for k, v in r.items() if k != "_debug"} for r in results]
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(clean, f, indent=2, ensure_ascii=False)
+#     print(f"  [JSON] → {path}")
+
+
+# def save_csv(results: list, out_dir: str):
+#     path = os.path.join(out_dir, f"cards_{_ts()}.csv")
+#     fields = [
+#         "file",
+#         "name",
+#         "job_title",
+#         "company",
+#         "email",
+#         "phone_1",
+#         "phone_2",
+#         "website",
+#         "address",
+#         "linkedin",
+#         "twitter",
+#     ]
+#     with open(path, "w", newline="", encoding="utf-8") as f:
+#         w = csv.DictWriter(f, fieldnames=fields)
+#         w.writeheader()
+#         for r in results:
+#             ph = r.get("phones", [])
+#             w.writerow(
+#                 {
+#                     "file": r.get("file", ""),
+#                     "name": r.get("name", ""),
+#                     "job_title": r.get("job_title", ""),
+#                     "company": r.get("company", ""),
+#                     "email": r.get("email", ""),
+#                     "phone_1": ph[0] if ph else "",
+#                     "phone_2": ph[1] if len(ph) > 1 else "",
+#                     "website": r.get("website", ""),
+#                     "address": r.get("address", ""),
+#                     "linkedin": r.get("linkedin", ""),
+#                     "twitter": r.get("twitter", ""),
+#                 }
+#             )
+#     print(f"  [CSV]  → {path}")
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ENTRY POINT
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".heic"}
+
+
+# def collect_paths(target: str) -> list:
+#     p = Path(target)
+#     if p.is_file():
+#         return [str(p)]
+#     if p.is_dir():
+#         return sorted(str(f) for f in p.iterdir() if f.suffix.lower() in _IMG_EXTS)
+#     return []
+
+
+# def gui_pick() -> list:
+#     try:
+#         from tkinter import Tk, filedialog
+
+#         root = Tk()
+#         root.withdraw()
+#         paths = filedialog.askopenfilenames(
+#             title="Select Visiting Card Image(s)",
+#             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.webp")],
+#         )
+#         root.destroy()
+#         return list(paths)
+#     except Exception:
+#         print("  [WARN] Tkinter not available. Pass the image path as a CLI arg.")
+#         return []
+
+
+# def main():
+#     ap = argparse.ArgumentParser(
+#         description="Visiting Card OCR Extractor v5.0 — global, no hardcoded regions"
+#     )
+#     ap.add_argument(
+#         "target",
+#         nargs="?",
+#         default=None,
+#         help="Image file or folder (blank → GUI picker)",
+#     )
+#     ap.add_argument(
+#         "--debug",
+#         action="store_true",
+#         help="Save DEBUG_preprocessed_v5.png, DEBUG_annotated_v5.png, "
+#         "and dump raw token/line info to terminal",
+#     )
+#     ap.add_argument("--no-json", action="store_true")
+#     ap.add_argument("--no-csv", action="store_true")
+#     args = ap.parse_args()
+
+#     paths = collect_paths(args.target) if args.target else gui_pick()
+#     if not paths:
+#         print("  No images found. Exiting.")
+#         sys.exit(0 if not args.target else 1)
+
+#     print(f"\n  {len(paths)} image(s) to process.\n")
+
+#     results = []
+#     out_dir = os.path.dirname(os.path.abspath(paths[0]))
+
+#     for i, path in enumerate(paths, 1):
+#         print(f"  [{i}/{len(paths)}] {os.path.basename(path)}")
+#         try:
+#             r = process_card(path, debug=args.debug)
+#             print_result(r)
+#             results.append(r)
+#         except Exception as e:
+#             print(f"  [ERROR] {path}: {e}")
+#             if args.debug:
+#                 import traceback
+
+#                 traceback.print_exc()
+
+#     if results:
+#         if not args.no_json:
+#             save_json(results, out_dir)
+#         if not args.no_csv:
+#             save_csv(results, out_dir)
+
+#     print("\n  Done.")
+
+
+# if __name__ == "__main__":
+#     main()
+
+
+#!/usr/bin/env python3
+
+
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           VISITING CARD OCR EXTRACTOR — ULTIMATE BUILD v5.0                ║
+║           VISITING CARD OCR EXTRACTOR  v5.0  —  FINAL EDITION              ║
 ║                                                                              ║
-║  Extracts : Name · Phone · Email · Company · Address · Job Title            ║
-║  Input    : JPG · PNG · PDF · TIFF · BMP                                    ║
-║  Output   : Colour-coded Excel sheet + full debug log                       ║
-║                                                                              ║
-║  CHANGELOG v4.0 → v5.0  (confirmed by diagnostic image analysis)           ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║  ROOT CAUSE IDENTIFIED AND FIXED:                                           ║
-║                                                                              ║
-║  _is_dark_background() used np.mean() on the FULL image including the      ║
-║  white border/background surrounding the card.  The white border raised     ║
-║  the mean above 128, so the dark charcoal card was NEVER inverted.          ║
-║  EasyOCR received white-text-on-dark which caused every downstream error:   ║
-║    • Name split into "A D ITYA" [0.43 RED] + "V . VAR MA" [0.83]          ║
-║    • Email fragmented into 5 separate tokens, never assembled               ║
-║    • Job title read as "P RIN CIPAL ARCHITECT & FOUNDER"                   ║
-║    • Company missing "INFRA" token                                          ║
-║    • "Surt" misread for "Surat"                                             ║
-║    • Quality cascaded to YELLOW                                             ║
-║                                                                              ║
-║  FIX-8  Centre-crop dark background detection                               ║
-║         Samples middle 40%×40% of image (card body, not border)            ║
-║         Two-condition check: mean AND dark-pixel-ratio must both agree      ║
-║  FIX-9  Stronger contrast boost for inverted dark cards (α=2.0 vs 1.4)    ║
-║                                                                              ║
-║  All v4.0 fixes (FIX-1 through FIX-7) retained.                           ║
+║  ► No hardcoded countries, cities, or regions — works on ANY card globally  ║
+║  ► Multi-engine: EasyOCR  +  Tesseract fallback for maximum coverage        ║
+║  ► Full deskew pipeline  — handles tilted / rotated cards                   ║
+║  ► CLAHE + adaptive preprocessing — works on dark, light, and grey cards    ║
+║  ► Triple-pass OCR — normal, brightened, darkened — catches all text tones  ║
+║  ► Fuzzy reconstruction  — handles spaced letters, OCR artefacts            ║
+║  ► Auto Y-tolerance — adapts to font size, no manual tuning needed          ║
+║  ► Exports JSON + XLSX per run                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-
-INSTALL DEPENDENCIES:
-    pip install opencv-python easyocr pandas numpy torch pdf2image
-                phonenumbers pyspellchecker rapidfuzz openpyxl Pillow
-
-POPPLER (required for PDF support only):
-    Windows → https://github.com/oschwartz10612/poppler-windows/releases
-              Set env var: POPPLER_PATH=C:\\poppler\\Library\\bin
-    Linux   → sudo apt install poppler-utils
-    macOS   → brew install poppler
 """
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — IMPORTS
-# ══════════════════════════════════════════════════════════════════════════════
-import os
-import re
-import sys
-import logging
-import traceback
+import os, re, sys, json, math, warnings, argparse, unicodedata
 from pathlib import Path
+from datetime import datetime
 
 import cv2
 import numpy as np
-import pandas as pd
-import torch
-import easyocr
-import phonenumbers
-from phonenumbers import NumberParseException, PhoneNumberFormat
-from rapidfuzz import process as fuzz_process, fuzz
-from spellchecker import SpellChecker
-from pdf2image import convert_from_path
-from tkinter import Tk, filedialog
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
+from PIL import Image
+
+try:
+    import easyocr
+
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    print("  [WARN] easyocr not installed — pip install easyocr")
+
+try:
+    import pytesseract
+
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    print("  [WARN] pytesseract not installed — pip install pytesseract")
+
+try:
+    import torch
+
+    GPU_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    GPU_AVAILABLE = False
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
+    from openpyxl.utils import get_column_letter
+
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("  [WARN] openpyxl not installed — pip install openpyxl  (no Excel output)")
+
+warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — CONFIGURATION
+#  TUNEABLE CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-CONFIG = {
-    # ── Preprocessing ─────────────────────────────────────────────────────
-    "RESIZE_SCALE": 0.85,
-    "CONTRAST_ALPHA": 1.4,
-    "CONTRAST_BETA": 0,
-    "STD_DEV_HIGH": 60,
-    "ADAPTIVE_BLOCK_SIZE": 15,
-    "ADAPTIVE_C": 8,
-    # ── Dark Background ───────────────────────────────────────────────────
-    "DARK_BG_THRESHOLD": 128,
-    # ── Card Segmentation ─────────────────────────────────────────────────
-    "MIN_CARD_HEIGHT_PX": 200,
-    "MIN_CARD_WIDTH_PX": 150,
-    "SEGMENT_PADDING_PX": 15,
-    "NOISE_THRESHOLD_RATIO": 0.01,
-    # ── OCR ───────────────────────────────────────────────────────────────
-    "OCR_WIDTH_THRESHOLD": 0.7,
-    "OCR_MIN_CONFIDENCE": 0.45,
-    # ── FIX-2: Cross-token join window ────────────────────────────────────
-    # Tokens whose bounding boxes are within this many pixels vertically
-    # are considered to be on the same line and are joined before field
-    # extraction.  Tuned to ~1.5× typical character height on a 300-DPI scan.
-    "SAME_LINE_Y_TOLERANCE_PX": 18,
-    # ── FIX-3: Adjacent split-word gap ────────────────────────────────────
-    # Two consecutive tokens that are horizontally adjacent within this many
-    # pixels AND whose combined text forms a known keyword are merged.
-    # Prevents "FOUND ER", "ARCHI TECT", "SOLU TIONS" etc.
-    "SPLIT_WORD_X_GAP_PX": 22,
-    # ── Name Detection ────────────────────────────────────────────────────
-    "NAME_ZONE_RATIO": 0.65,  # Raised from 0.35 — centred names need more room
-    "NAME_MIN_WORDS": 1,
-    "NAME_MAX_WORDS": 6,  # Raised from 4 — "Aditya V. Varma" = 3 but
-    # names like "Dr. Priya Anand Sharma" = 4
-    # ── Spell Correction ──────────────────────────────────────────────────
-    "SPELL_MAX_LEN_DIFF": 2,
-    # ── Phone Parsing ─────────────────────────────────────────────────────
-    "DEFAULT_REGION": "IN",
-    # ── Fuzzy Matching ────────────────────────────────────────────────────
-    "FUZZY_SCORE_CUTOFF": 82,
-    # ── FIX-4: PIN↔city cross-validation map ─────────────────────────────
-    # Maps 6-digit PIN code prefix → canonical city name.
-    # When a token near a PIN code fuzzy-matches a city in this map,
-    # the city name is corrected to the canonical form regardless of
-    # what pyspellchecker says.  Extend freely.
-    "PIN_PREFIX_TO_CITY": {
-        "395": "Surat",
-        "380": "Ahmedabad",
-        "390": "Vadodara",
-        "360": "Rajkot",
-        "382": "Gandhinagar",
-        "400": "Mumbai",
-        "411": "Pune",
-        "560": "Bangalore",
-        "110": "Delhi",
-        "500": "Hyderabad",
-        "600": "Chennai",
-        "700": "Kolkata",
-        "302": "Jaipur",
-        "226": "Lucknow",
-        "452": "Indore",
-        "440": "Nagpur",
-        "160": "Chandigarh",
-        "682": "Kochi",
-        "641": "Coimbatore",
-    },
-    # ── Output ────────────────────────────────────────────────────────────
-    "OUTPUT_FILENAME": "Visiting_Card_Data_ULTIMATE.xlsx",
-    "LOG_FILENAME": "ocr_pipeline.log",
-    # ── Poppler ───────────────────────────────────────────────────────────
-    "POPPLER_PATH": os.environ.get("POPPLER_PATH", None),
-    "PDF_DPI": 200,
-}
-
+DARK_BG_THRESHOLD = 128
+DARK_PIXEL_RATIO = 0.50
+RESIZE_MAX_SIDE = 2200
+RESIZE_MIN_SIDE = 900
+CLAHE_CLIP = 2.5
+CLAHE_TILE = (8, 8)
+UNSHARP_AMOUNT = 0.55
+STD_DEV_ADAPTIVE = 42
+OCR_CONF_THRESHOLD = 0.28
+OCR_WIDTH_THS = 0.75
+OCR_DECODER = "greedy"
+LINE_Y_BASE_TOL = 28
+PHONE_MIN_DIGITS = 6
+PHONE_MAX_DIGITS = 15
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — LOGGING
+#  COMPILED REGEX
 # ══════════════════════════════════════════════════════════════════════════════
-def _setup_logging() -> logging.Logger:
-    logger = logging.getLogger("card_ocr")
-    logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S"
-    )
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    fh = logging.FileHandler(CONFIG["LOG_FILENAME"], mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(ch)
-    logger.addHandler(fh)
-    return logger
-
-
-log = _setup_logging()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — DOMAIN CONSTANTS
-# ══════════════════════════════════════════════════════════════════════════════
-JOB_TITLE_KEYWORDS: frozenset = frozenset(
-    {
-        "manager",
-        "developer",
-        "engineer",
-        "director",
-        "partner",
-        "consultant",
-        "founder",
-        "ceo",
-        "cto",
-        "coo",
-        "cfo",
-        "analyst",
-        "lead",
-        "specialist",
-        "head",
-        "officer",
-        "executive",
-        "president",
-        "associate",
-        "senior",
-        "junior",
-        "principal",
-        "architect",
-        "vp",
-        "vice",
-        "intern",
-        "trainee",
-        "advisor",
-        "coordinator",
-        "supervisor",
-        "assistant",
-        "deputy",
-        "md",
-        "proprietor",
-        "owner",
-        "chairman",
-        "trustee",
-        "secretary",
-        "treasurer",
-        "representative",
-        "agent",
-        "broker",
-        "dealer",
-        "distributor",
-    }
+_TLD = (
+    r"(?:com|in|org|net|co\.in|co\.uk|io|biz|info|edu|gov|"
+    r"ae|us|au|nz|sg|hk|my|ph|za|de|fr|jp|cn|ca|br|mx|"
+    r"co\.ae|co\.sg|co\.za|co\.au|co\.nz|co\.jp|co\.ca|"
+    r"tech|app|dev|ai)"
+)
+_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+\s*@\s*[A-Za-z0-9.\-]+\s*\.\s*" + _TLD, re.IGNORECASE
+)
+_WEB_RE = re.compile(
+    r"(?:https?://|www\.)[A-Za-z0-9.\-/_%?=&#]+"
+    r"|[A-Za-z0-9\-]+\.(?:com|in|org|net|io|co\.in|co\.uk|biz)[/\w\-]*",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(
+    r"(?:\+\s*\d{1,4}[\s\-\.]*)?(?:\([\d\s]+\)[\s\-\.]*)?[\d][\d\s\-\.]{4,18}[\d]"
+)
+_LINKEDIN_RE = re.compile(r"linkedin\.com/in/[A-Za-z0-9_\-]+", re.IGNORECASE)
+_TWITTER_RE = re.compile(
+    r"(?:twitter\.com/|x\.com/|@)[A-Za-z0-9_]{2,50}", re.IGNORECASE
 )
 
-COMPANY_KEYWORDS: frozenset = frozenset(
-    {
-        "ltd",
-        "limited",
-        "inc",
-        "llp",
-        "pvt",
-        "private",
-        "solutions",
-        "consulting",
-        "studio",
-        "technologies",
-        "tech",
-        "group",
-        "company",
-        "labs",
-        "services",
-        "systems",
-        "enterprises",
-        "associates",
-        "builders",
-        "construction",
-        "industries",
-        "global",
-        "international",
-        "ventures",
-        "holdings",
-        "capital",
-        "networks",
-        "media",
-        "digital",
-        "infra",
-        "infrastructure",
-        "realty",
-        "properties",
-        "pharma",
-        "healthcare",
-        "clinic",
-        "hospital",
-        "school",
-        "academy",
-        "institute",
-        "trading",
-        "exports",
-        "imports",
-        "logistics",
-        "finance",
-        "investments",
-    }
+_TITLE_KW = re.compile(
+    r"\b(?:manager|director|engineer|developer|architect|founder|partner|"
+    r"consultant|analyst|officer|executive|president|associate|senior|"
+    r"junior|principal|head|lead|specialist|advisor|coordinator|"
+    r"supervisor|assistant|proprietor|owner|chairman|trustee|secretary|"
+    r"treasurer|intern|trainee|ceo|cto|coo|cfo|cmo|md|vp|"
+    r"vice\s*president|doctor|dr\.?|prof\.?|professor|lawyer|advocate|"
+    r"solicitor|barrister|accountant|auditor|designer|strategist|"
+    r"planner|researcher|scientist|technician|operator|representative|"
+    r"agent|broker|dealer|trader|contractor|builder)\b",
+    re.IGNORECASE,
 )
 
-ADDRESS_KEYWORDS: frozenset = frozenset(
-    {
-        "road",
-        "street",
-        "complex",
-        "floor",
-        "level",
-        "nagar",
-        "city",
-        "park",
-        "tower",
-        "building",
-        "block",
-        "sector",
-        "phase",
-        "plot",
-        "avenue",
-        "lane",
-        "colony",
-        "society",
-        "residency",
-        "plaza",
-        "centre",
-        "center",
-        "mall",
-        "near",
-        "opp",
-        "opposite",
-        "highway",
-        "junction",
-        "bridge",
-        "station",
-        "airport",
-        "cross",
-        "marg",
-        "chowk",
-        "bazaar",
-        "market",
-        "ring road",
-        "wing",
-    }
+_COMPANY_KW = re.compile(
+    r"\b(?:ltd|limited|inc|llp|llc|pvt|private|plc|corp|corporation|"
+    r"solutions|consulting|studio|technologies|tech|group|company|co\.|"
+    r"labs|services|systems|enterprises|associates|builders|construction|"
+    r"industries|global|international|ventures|holdings|capital|networks|"
+    r"media|digital|infra|infrastructure|realty|realtors|properties|"
+    r"developers|architects|interiors|design|agency|firm|bureau|office|"
+    r"foundation|trust|institute|academy|school|college|hospital|clinic|"
+    r"healthcare|pharma|logistics|transport|exports|imports|trading|"
+    r"manufacturing|fabrication|engineering)\b",
+    re.IGNORECASE,
 )
 
-KNOWN_CITIES: frozenset = frozenset(
-    {
-        "ahmedabad",
-        "surat",
-        "mumbai",
-        "pune",
-        "bangalore",
-        "bengaluru",
-        "delhi",
-        "new delhi",
-        "hyderabad",
-        "chennai",
-        "kolkata",
-        "jaipur",
-        "vadodara",
-        "rajkot",
-        "gandhinagar",
-        "noida",
-        "gurugram",
-        "gurgaon",
-        "indore",
-        "bhopal",
-        "nagpur",
-        "lucknow",
-        "chandigarh",
-        "kochi",
-        "coimbatore",
-        "visakhapatnam",
-        "patna",
-        "agra",
-        "nashik",
-        "faridabad",
-        "meerut",
-        "thane",
-        "navi mumbai",
-        "aurangabad",
-        "srinagar",
-        "amritsar",
-        "dhanbad",
-    }
+_ADDR_KW = re.compile(
+    r"\b(?:floor|fl\.|level|suite|no\.|plot|block|sector|phase|unit|"
+    r"road|rd\.|street|st\.|avenue|ave\.|lane|ln\.|boulevard|blvd\.|"
+    r"nagar|vihar|marg|gali|chowk|bazaar|market|colony|society|"
+    r"residency|plaza|centre|center|mall|complex|tower|building|"
+    r"district|area|zone|suburb|village|town|city|state|province|"
+    r"county|region|po\s*box|p\.o\.|zip|pin)\b",
+    re.IGNORECASE,
 )
 
-BUSINESS_CARD_VOCAB: set = {
-    "ahmedabad",
-    "surat",
-    "vadodara",
-    "rajkot",
-    "gandhinagar",
-    "mumbai",
-    "pune",
-    "bangalore",
-    "bengaluru",
-    "delhi",
-    "hyderabad",
-    "chennai",
-    "kolkata",
-    "jaipur",
-    "lucknow",
-    "indore",
-    "nagpur",
-    "gurugram",
-    "ltd",
-    "llp",
-    "pvt",
-    "inc",
-    "corp",
-    "co",
-    "llc",
-    "limited",
-    "solutions",
-    "consulting",
-    "technologies",
-    "infotech",
-    "services",
-    "enterprises",
-    "associates",
-    "group",
-    "studio",
-    "labs",
-    "tech",
-    "digital",
-    "systems",
-    "global",
-    "ventures",
-    "innovations",
-    "infosys",
-    "ceo",
-    "cto",
-    "cfo",
-    "coo",
-    "md",
-    "vp",
-    "avp",
-    "gm",
-    "agm",
-    "director",
-    "manager",
-    "engineer",
-    "developer",
-    "consultant",
-    "analyst",
-    "executive",
-    "officer",
-    "partner",
-    "founder",
-    "specialist",
-    "coordinator",
-    "architect",
-    "designer",
-    "tower",
-    "floor",
-    "building",
-    "complex",
-    "nagar",
-    "road",
-    "street",
-    "avenue",
-    "sector",
-    "phase",
-    "block",
-    "wing",
-    "plaza",
-    "centre",
-    "center",
-    "park",
-    "square",
-    "chowk",
-    "infra",
-    "infrastructure",
-    "skytower",
-    "skytoiver",  # common OCR variant of SkyTower
-}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — SPELL CORRECTION
+#  BBOX HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-spell = SpellChecker()
-spell.word_frequency.load_words(BUSINESS_CARD_VOCAB)
+def mid_y(bbox):
+    return (bbox[0][1] + bbox[2][1]) / 2.0
 
 
-def smart_correct(word: str) -> str:
-    """
-    Corrects a single word only when safe to do so.
-    See v3.0 for full rationale — logic unchanged here.
-    Contextual city correction (FIX-4) is handled separately in
-    correct_city_near_pin() because it requires the surrounding PIN code.
-    """
-    if len(word) <= 2:
-        return word
-    if re.search(r"\d", word):
-        return word
-    if "@" in word or "." in word:
-        return word
-    if word.isupper() and len(word) <= 5:
-        return word
-
-    lower = word.lower()
-    if lower in spell:
-        return word
-
-    correction = spell.correction(lower)
-    if correction is None or correction == lower:
-        return word
-    if abs(len(correction) - len(lower)) > CONFIG["SPELL_MAX_LEN_DIFF"]:
-        return word
-
-    if word.isupper():
-        return correction.upper()
-    if word[0].isupper():
-        return correction.capitalize()
-    return correction
-
-
-def correct_text(text: str) -> str:
-    """Applies smart_correct to every word, rebuilding the string."""
-    return " ".join(smart_correct(w) for w in text.split())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — FIX-1 + FIX-3: TOKEN-LEVEL RECONSTRUCTION
-#
-# Two problems addressed here:
-#
-# FIX-1 — Spaced-letter reconstruction
-# ────────────────────────────────────
-# Some professional card fonts (wide-tracked, spaced caps) cause EasyOCR to
-# read each letter as an individual token:
-#     ["A", "D", "I", "T", "Y", "A", "V", ".", "V", "A", "R", "M", "A"]
-# or as single-letter tokens on the same Y line:
-#     ["A D I T Y A", "V .", "V A R M A"]
-#
-# Detection: tokens that are ALL single characters (or single char + dot)
-# on the same baseline are collapsed into one word.
-#
-# FIX-3 — Split-word merging
-# ──────────────────────────
-# Kerning artefacts or tight bounding-box clipping cause OCR to split words:
-#     "FOUND" + "ER" → should be "FOUNDER"
-#     "ARCHI" + "TECT" → should be "ARCHITECT"
-#     "SOLU"  + "TIONS" → should be "SOLUTIONS"
-#
-# Detection: two consecutive tokens on the same line within SPLIT_WORD_X_GAP_PX
-# whose concatenation (no space) matches a word in our vocab OR a known keyword.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _bbox_top_y(bbox) -> float:
-    """Y coordinate of the top edge of an EasyOCR bounding box."""
+def top_y(bbox):
     return float(bbox[0][1])
 
 
-def _bbox_bottom_y(bbox) -> float:
-    return float(bbox[2][1])
-
-
-def _bbox_mid_y(bbox) -> float:
-    return (_bbox_top_y(bbox) + _bbox_bottom_y(bbox)) / 2.0
-
-
-def _bbox_left_x(bbox) -> float:
+def left_x(bbox):
     return float(bbox[0][0])
 
 
-def _bbox_right_x(bbox) -> float:
-    return float(bbox[1][0])
+def height_px(bbox):
+    return float(bbox[2][1] - bbox[0][1])
 
 
-def _on_same_line(bbox_a, bbox_b) -> bool:
-    """
-    Returns True when two bounding boxes share the same text baseline,
-    i.e. their vertical midpoints are within SAME_LINE_Y_TOLERANCE_PX.
-    """
-    return (
-        abs(_bbox_mid_y(bbox_a) - _bbox_mid_y(bbox_b))
-        <= CONFIG["SAME_LINE_Y_TOLERANCE_PX"]
-    )
+def width_px(bbox):
+    return float(bbox[1][0] - bbox[0][0])
 
 
-def _is_spaced_letter_token(text: str) -> bool:
-    """
-    Returns True if every space-separated segment in `text` is a single
-    character (or a single char followed by a dot, e.g. "V.").
-    Identifies spaced-letter OCR artefacts like "A D I T Y A" or "V .".
-    """
-    segments = text.strip().split()
-    if len(segments) < 2:
-        return False
-    return all(re.fullmatch(r"[A-Za-z]\.?", seg) for seg in segments)
-
-
-def _collapse_spaced_letters(text: str) -> str:
-    """
-    "A D I T Y A" → "ADITYA"
-    "V ."         → "V."
-    "V A R M A"   → "VARMA"
-    Dot after a letter is kept (middle initial like "V.").
-    """
-    segments = text.strip().split()
-    return "".join(segments)
-
-
-def _concat_forms_keyword(a: str, b: str) -> bool:
-    """
-    Returns True if concatenating token `a` and token `b` (no space) produces
-    a string that is in our BUSINESS_CARD_VOCAB, JOB_TITLE_KEYWORDS, or
-    COMPANY_KEYWORDS — indicating a split word.
-    Case-insensitive check.
-    """
-    combined = (a + b).lower()
-    all_keywords = BUSINESS_CARD_VOCAB | JOB_TITLE_KEYWORDS | COMPANY_KEYWORDS
-    return combined in all_keywords
-
-
-def reconstruct_tokens(ocr_results: list) -> list:
-    """
-    Two-pass token reconstruction applied BEFORE any field extractor runs.
-
-    Pass A — Spaced-letter reconstruction (FIX-1)
-    ─────────────────────────────────────────────
-    Groups consecutive tokens on the same baseline that are individually
-    spaced-letter patterns.  Merges them into a single token joined by spaces
-    at word boundaries.
-
-    Example (3 tokens on same line):
-        ("A D I T Y A", conf=0.95)  ("V .", conf=0.97)  ("V A R M A", conf=0.94)
-        → ("ADITYA V. VARMA", conf=0.95)   (avg confidence)
-
-    Pass B — Split-word merging (FIX-3)
-    ────────────────────────────────────
-    Scans consecutive token pairs on the same line.  If their horizontal gap
-    is ≤ SPLIT_WORD_X_GAP_PX AND their concatenation forms a known keyword,
-    they are merged.
-
-    Example:
-        ("FOUND", conf=0.88)  ("ER", conf=0.82)
-        → ("FOUNDER", conf=0.85)
-
-    Both passes preserve average confidence so downstream thresholds still work.
-    """
-
-    # ── Pass A: Spaced-letter reconstruction ─────────────────────────────
-    # Sort by (mid_y, left_x) so same-line tokens appear consecutively.
-    sorted_results = sorted(
-        ocr_results, key=lambda r: (_bbox_mid_y(r[0]), _bbox_left_x(r[0]))
-    )
-
-    merged_a: list = []
-    skip: set = set()
-
-    for i, (bbox_i, text_i, conf_i) in enumerate(sorted_results):
-        if i in skip:
-            continue
-
-        if not _is_spaced_letter_token(text_i):
-            merged_a.append((bbox_i, text_i, conf_i))
-            continue
-
-        # This token looks like "A D I T Y A" — collect adjacent same-line
-        # spaced-letter tokens to build the full name
-        group_bboxes = [bbox_i]
-        group_texts = [_collapse_spaced_letters(text_i)]
-        group_confs = [conf_i]
-
-        j = i + 1
-        while j < len(sorted_results) and j not in skip:
-            bbox_j, text_j, conf_j = sorted_results[j]
-            if not _on_same_line(bbox_i, bbox_j):
-                break
-            if _is_spaced_letter_token(text_j):
-                group_texts.append(_collapse_spaced_letters(text_j))
-                group_confs.append(conf_j)
-                group_bboxes.append(bbox_j)
-                skip.add(j)
-            else:
-                # Non-spaced-letter token on same line — stop collecting
-                break
-            j += 1
-
-        # Build a merged bbox (top-left of first, bottom-right of last)
-        tl = group_bboxes[0][0]
-        tr = group_bboxes[-1][1]
-        br = group_bboxes[-1][2]
-        bl = group_bboxes[0][3]
-        merged_bbox = [tl, tr, br, bl]
-
-        # Rejoin collapsed letter-groups with spaces where word boundaries are
-        # Heuristic: if collapsed segment has > 1 char it's a word; separate by space
-        rejoined = " ".join(group_texts)
-        avg_conf = float(np.mean(group_confs))
-
-        log.debug(
-            f"  [FIX-1] Spaced-letter merge: "
-            f"{[t for t in group_texts]} → '{rejoined}' ({avg_conf:.2f})"
-        )
-        merged_a.append((merged_bbox, rejoined, avg_conf))
-
-    # ── Pass B: Split-word merging ────────────────────────────────────────
-    merged_b: list = []
-    skip_b: set = set()
-
-    for i, (bbox_i, text_i, conf_i) in enumerate(merged_a):
-        if i in skip_b:
-            continue
-
-        if i + 1 < len(merged_a):
-            bbox_j, text_j, conf_j = merged_a[i + 1]
-
-            gap = _bbox_left_x(bbox_j) - _bbox_right_x(bbox_i)
-            same_line = _on_same_line(bbox_i, bbox_j)
-            close_enough = gap <= CONFIG["SPLIT_WORD_X_GAP_PX"]
-
-            if same_line and close_enough and _concat_forms_keyword(text_i, text_j):
-                merged_text = text_i + text_j  # No space — they ARE one word
-                merged_conf = float(np.mean([conf_i, conf_j]))
-                tl = bbox_i[0]
-                tr = bbox_j[1]
-                br = bbox_j[2]
-                bl = bbox_i[3]
-                merged_bbox = [tl, tr, br, bl]
-                log.debug(
-                    f"  [FIX-3] Split-word merge: "
-                    f"'{text_i}' + '{text_j}' → '{merged_text}' ({merged_conf:.2f})"
-                )
-                merged_b.append((merged_bbox, merged_text, merged_conf))
-                skip_b.add(i + 1)
-                continue
-
-        merged_b.append((bbox_i, text_i, conf_i))
-
-    return merged_b
+def _bbox_key(bbox):
+    return f"{int(left_x(bbox)//14)},{int(top_y(bbox)//14)}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — FIX-2: LINE-LEVEL JOINING FOR EMAIL DETECTION
-#
-# EasyOCR can return a spaced email like "aditya.v @ urbanedgeinfra . co . in"
-# as MULTIPLE tokens, e.g.:
-#     "aditya.v"  "@"  "urbanedgeinfra"  "."  "co"  "."  "in"
-# or as one token with internal spaces:
-#     "aditya.v @ urbanedgeinfra . co . in"
-#
-# The v3.0 code only stripped spaces within a SINGLE token.  Multi-token
-# emails were never assembled and always returned "N/A".
-#
-# Fix: group all tokens on the same line, join them without spaces, then
-# run the email regex on the joined string.  This is safe because a real
-# email address on a card is always on its own line.
+#  IMAGE LOADING
 # ══════════════════════════════════════════════════════════════════════════════
+def load_image(path):
+    img = cv2.imread(path)
+    if img is None:
+        try:
+            pil = Image.open(path).convert("RGB")
+            img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            raise ValueError(f"Cannot open image: {path}\n{e}")
+    return img
 
 
-def build_line_strings(ocr_results: list) -> list:
-    """
-    Groups tokens into visual lines using Y-coordinate proximity, then
-    returns a list of (joined_no_space_string, avg_conf, representative_bbox)
-    for every detected line.
-
-    This gives extract_email() a complete, space-stripped version of each
-    line to match against, catching multi-token email addresses.
-    """
-    if not ocr_results:
-        return []
-
-    # Sort by mid-Y then left-X (reading order)
-    sorted_r = sorted(
-        ocr_results, key=lambda r: (_bbox_mid_y(r[0]), _bbox_left_x(r[0]))
-    )
-
-    lines: list = []  # list of [(bbox, text, conf), ...]
-    current_line: list = [sorted_r[0]]
-
-    for item in sorted_r[1:]:
-        if _on_same_line(item[0], current_line[0][0]):
-            current_line.append(item)
-        else:
-            lines.append(current_line)
-            current_line = [item]
-    lines.append(current_line)
-
-    result = []
-    for line_tokens in lines:
-        joined_nospace = re.sub(r"\s+", "", "".join(t for _, t, _ in line_tokens))
-        joined_space = " ".join(t for _, t, _ in line_tokens)
-        avg_conf = float(np.mean([c for _, _, c in line_tokens]))
-        rep_bbox = line_tokens[0][0]
-        result.append(
-            {
-                "nospace": joined_nospace,
-                "spaced": joined_space,
-                "conf": avg_conf,
-                "bbox": rep_bbox,
-                "tokens": line_tokens,
-            }
-        )
-
-    return result
+def resize_for_ocr(img):
+    h, w = img.shape[:2]
+    max_s, min_s = max(h, w), min(h, w)
+    if max_s < RESIZE_MIN_SIDE:
+        scale = RESIZE_MIN_SIDE / min_s
+    elif max_s > RESIZE_MAX_SIDE:
+        scale = RESIZE_MAX_SIDE / max_s
+    else:
+        scale = 1.0
+    if abs(scale - 1.0) > 0.02:
+        interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=interp)
+    return img
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — FIX-4: PIN↔CITY CROSS-VALIDATION
-#
-# Problem: "Surt" and "Sure" both pass pyspellchecker unchanged because:
-#   • "Surt" is 4 chars, ALL-CAPS → smart_correct() skips ALL-CAPS ≤ 5
-#   • "Sure" is a valid English word → spellchecker returns "sure"
-#
-# Fix: when we find a 6-digit PIN code in the OCR output, look up the
-# canonical city for that PIN prefix in CONFIG["PIN_PREFIX_TO_CITY"].
-# Any token on the same line as the PIN that fuzzy-matches the expected
-# city name is replaced with the canonical city name.
-#
-# This is purely contextual — we only correct a city when we have the
-# independent evidence of a nearby PIN code to validate against.
+#  DESKEW
 # ══════════════════════════════════════════════════════════════════════════════
+def deskew(img):
 
-
-def correct_city_near_pin(ocr_results: list) -> list:
-    """
-    Scans all tokens for 6-digit PIN codes, derives the canonical city from
-    CONFIG["PIN_PREFIX_TO_CITY"], then corrects any nearby city-like token.
-
-    Returns a new list of (bbox, text, conf) tuples with city names fixed.
-    """
-    PIN_RE = re.compile(r"\b(\d{6})\b")
-    corrected = list(ocr_results)  # shallow copy — we'll replace entries
-
-    # Build a lookup: index → canonical_city for every token that contains a PIN
-    pin_corrections: dict = {}  # token_index → canonical_city
-
-    for idx, (bbox, text, conf) in enumerate(corrected):
-        m = PIN_RE.search(text)
-        if not m:
-            continue
-        pin = m.group(1)
-        prefix = pin[:3]
-        canonical = CONFIG["PIN_PREFIX_TO_CITY"].get(prefix)
-        if canonical:
-            log.debug(f"  [FIX-4] PIN {pin} → expected city '{canonical}'")
-            pin_corrections[idx] = canonical
-
-    if not pin_corrections:
-        return corrected
-
-    # For every identified PIN token, check its same-line neighbours
-    for pin_idx, canonical_city in pin_corrections.items():
-        pin_bbox = corrected[pin_idx][0]
-
-        for idx, (bbox, text, conf) in enumerate(corrected):
-            if idx == pin_idx:
-                continue
-            if not _on_same_line(pin_bbox, bbox):
-                continue
-
-            # Does this token look like a garbled city name?
-            score = fuzz.partial_ratio(text.lower(), canonical_city.lower())
-            if score >= CONFIG["FUZZY_SCORE_CUTOFF"]:
-                log.debug(
-                    f"  [FIX-4] City correction: '{text}' → '{canonical_city}' "
-                    f"(score={score}, PIN={corrected[pin_idx][1]})"
-                )
-                corrected[idx] = (bbox, canonical_city, conf)
-
-    return corrected
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — IMAGE PREPROCESSING
-#
-# ROOT CAUSE FIX (confirmed by diagnostic images):
-# ─────────────────────────────────────────────────
-# The original _is_dark_background() called np.mean() on the ENTIRE image.
-# This card image has a large white border/background surrounding the dark
-# card.  The white border pixels raised the mean well above 128, so the
-# function returned False and the card was NEVER inverted — even though the
-# card itself is dark charcoal with white text.
-#
-# Result: EasyOCR received white-text-on-dark-background, which caused:
-#   • "A D ITYA" split + confidence 0.43 (dropped as RED)
-#   • "V . VAR MA" partial name read
-#   • Email split across 5+ tokens
-#   • "Surt" misread for "Surat"
-#   • Overall quality YELLOW instead of GREEN
-#
-# Fix — Three-layer dark detection:
-#   Layer 1: Centre-crop test  — sample the middle 40% of the image where
-#            the card body always falls, ignoring surrounding white space.
-#   Layer 2: Dark-pixel-ratio  — count pixels below threshold; if >50% of
-#            the centre crop is dark, it's a dark card.
-#   Layer 3: Dual-pass OCR     — for dark cards, run OCR on BOTH the
-#            inverted image AND the original, then keep whichever pass
-#            yields more high-confidence tokens.  This handles edge cases
-#            where only part of the card is dark.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _is_dark_background(gray: np.ndarray) -> bool:
-    """
-    Detects dark-background cards by sampling the CENTRE of the image,
-    not the full image mean.
-
-    Why centre crop:
-        Cards photographed or scanned against a white surface have large
-        bright borders.  np.mean() over the full image is dominated by those
-        borders and returns a value well above 128 even for a jet-black card.
-
-        Sampling the central 40% × 40% region captures the card body and
-        ignores the surrounding background entirely.
-
-    Two-condition check (both must agree to call it dark):
-        1. Centre-crop mean < DARK_BG_THRESHOLD  (average darkness)
-        2. >50% of centre-crop pixels are below threshold (majority is dark)
-
-    This prevents a card with a single large dark logo from being falsely
-    classified as dark-background.
-    """
-    h, w = gray.shape
-    # Sample centre 40% in each dimension
-    y1, y2 = int(h * 0.30), int(h * 0.70)
-    x1, x2 = int(w * 0.30), int(w * 0.70)
-    centre = gray[y1:y2, x1:x2]
-
-    centre_mean = float(np.mean(centre))
-    dark_pixel_ratio = float(np.sum(centre < CONFIG["DARK_BG_THRESHOLD"])) / centre.size
-
-    is_dark = (centre_mean < CONFIG["DARK_BG_THRESHOLD"]) and (dark_pixel_ratio > 0.50)
-    log.debug(
-        f"  Dark-bg check: centre_mean={centre_mean:.1f} "
-        f"dark_pixel_ratio={dark_pixel_ratio:.2f} → {'DARK' if is_dark else 'LIGHT'}"
-    )
-    return is_dark
-
-
-def preprocess_image(img: np.ndarray) -> np.ndarray:
-    """
-    Converts a BGR card image into a preprocessed single-channel image.
-
-    v5.0 change:
-        Uses the fixed _is_dark_background() (centre-crop sampling).
-        For dark cards, applies inversion BEFORE thresholding so EasyOCR
-        always receives dark-text-on-light-background.
-
-        Additionally: for dark cards, the contrast boost alpha is raised
-        from 1.4 → 2.0 because inverted dark cards have lower native
-        contrast and need a stronger boost to make white-on-dark text
-        fully black after inversion.
-    """
-    scale = CONFIG["RESIZE_SCALE"]
-    img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    dark = _is_dark_background(gray)
-    if dark:
-        gray = cv2.bitwise_not(gray)
-        log.debug("  Dark background confirmed — image inverted.")
-        # Stronger contrast for inverted dark cards
-        alpha = 2.0
-    else:
-        alpha = CONFIG["CONTRAST_ALPHA"]
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    std_dev = float(np.std(gray))
-    if std_dev > CONFIG["STD_DEV_HIGH"]:
-        log.debug(f"  Preprocessing: global contrast boost α={alpha} (σ={std_dev:.1f})")
-        return cv2.convertScaleAbs(gray, alpha=alpha, beta=CONFIG["CONTRAST_BETA"])
-    else:
-        log.debug(f"  Preprocessing: adaptive threshold (σ={std_dev:.1f})")
-        return cv2.adaptiveThreshold(
+    otsu_t, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    edges = cv2.Canny(blur, otsu_t * 0.5, otsu_t)
+
+    lines = cv2.HoughLinesP(
+        edges, 1, math.pi / 180, threshold=80, minLineLength=60, maxLineGap=20
+    )
+
+    # No usable lines found
+    if lines is None or len(lines) < 3:
+        return img, 0.0
+
+    angles = []
+
+    # Extract valid angles
+    for line in lines:
+
+        x1, y1, x2, y2 = line[0]
+
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+
+        # Ignore vertical/extreme lines
+        if abs(angle) < 45:
+            angles.append(angle)
+
+    # No horizontal-like lines
+    if not angles:
+        return img, 0.0
+
+    median_angle = float(np.median(angles))
+
+    # Ignore tiny skew
+    if abs(median_angle) < 0.5:
+        return img, 0.0
+
+    h, w = img.shape[:2]
+
+    center = (w // 2, h // 2)
+
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+
+    cos_a = abs(M[0, 0])
+    sin_a = abs(M[0, 1])
+
+    new_w = int((h * sin_a) + (w * cos_a))
+    new_h = int((h * cos_a) + (w * sin_a))
+
+    # Adjust translation
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+
+    rotated = cv2.warpAffine(
+        img, M, (new_w, new_h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+
+    return rotated, median_angle
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+def _detect_dark_bg(gray):
+    h, w = gray.shape
+    y1, y2 = int(h * 0.30), int(h * 0.70)
+    x1, x2 = int(w * 0.30), int(w * 0.70)
+    c = gray[y1:y2, x1:x2]
+    return (
+        float(np.mean(c)) < DARK_BG_THRESHOLD
+        and float(np.sum(c < DARK_BG_THRESHOLD)) / c.size > DARK_PIXEL_RATIO
+    )
+
+
+def preprocess_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    is_dark = _detect_dark_bg(gray)
+    if is_dark:
+        gray = cv2.bitwise_not(gray)
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
+    gray = clahe.apply(gray)
+    blur = cv2.GaussianBlur(gray, (0, 0), 3)
+    gray = cv2.addWeighted(gray, 1 + UNSHARP_AMOUNT, blur, -UNSHARP_AMOUNT, 0)
+    std = float(np.std(gray))
+    if std < STD_DEV_ADAPTIVE:
+        mode = f"ADAPTIVE THRESHOLD (σ={std:.1f})"
+        gray = cv2.adaptiveThreshold(
             gray,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
-            blockSize=CONFIG["ADAPTIVE_BLOCK_SIZE"],
-            C=CONFIG["ADAPTIVE_C"],
+            blockSize=21,
+            C=10,
         )
+    else:
+        mode = f"CLAHE+UNSHARP (σ={std:.1f}, dark={is_dark})"
+    return gray, is_dark, mode
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — CARD SEGMENTATION  (unchanged from v3.0)
+#  OCR ENGINES
 # ══════════════════════════════════════════════════════════════════════════════
+_EASYOCR_READER = None
 
 
-def _find_valleys(projection, span, min_size, axis="h"):
-    noise_threshold = span * CONFIG["NOISE_THRESHOLD_RATIO"]
-    bounds = []
-    start = None
-    for i, val in enumerate(projection):
-        if val > noise_threshold and start is None:
-            start = i
-        elif val <= noise_threshold and start is not None:
-            if i - start >= min_size:
-                bounds.append((start, i))
-            start = None
-    if start is not None and (len(projection) - start) >= min_size:
-        bounds.append((start, len(projection)))
-    return bounds
+def _get_reader():
+    global _EASYOCR_READER
+    if _EASYOCR_READER is None and EASYOCR_AVAILABLE:
+        _EASYOCR_READER = easyocr.Reader(["en"], gpu=GPU_AVAILABLE, verbose=False)
+    return _EASYOCR_READER
 
 
-def segment_cards(image: np.ndarray) -> list:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    height, width = gray.shape
-    pad = CONFIG["SEGMENT_PADDING_PX"]
-    all_crops = []
+def run_easyocr(processed):
+    reader = _get_reader()
+    if reader is None:
+        return []
+    pool = {}
 
-    h_proj = np.sum(binary, axis=1)
-    h_bounds = _find_valleys(h_proj, width, CONFIG["MIN_CARD_HEIGHT_PX"], axis="h")
-    h_slices = h_bounds if h_bounds else [(0, height)]
+    def _pass(arr):
+        for bbox, text, conf in reader.readtext(
+            arr, width_ths=OCR_WIDTH_THS, decoder=OCR_DECODER, paragraph=False
+        ):
+            k = _bbox_key(bbox)
+            if k not in pool or conf > pool[k][2]:
+                pool[k] = (bbox, text, conf)
 
-    for y1, y2 in h_slices:
-        h_crop = image[max(0, y1 - pad) : min(height, y2 + pad), :]
-        gray_s = cv2.cvtColor(h_crop, cv2.COLOR_BGR2GRAY)
-        _, bin_s = cv2.threshold(
-            gray_s, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-        v_proj = np.sum(bin_s, axis=0)
-        v_bounds = _find_valleys(
-            v_proj, h_crop.shape[0], CONFIG["MIN_CARD_WIDTH_PX"], axis="v"
-        )
+    _pass(processed)
+    _pass(cv2.convertScaleAbs(processed, alpha=1.35, beta=25))
+    _pass(cv2.convertScaleAbs(processed, alpha=0.72, beta=-15))
+    return list(pool.values())
 
-        if len(v_bounds) > 1:
-            for x1, x2 in v_bounds:
-                v_crop = h_crop[:, max(0, x1 - pad) : min(h_crop.shape[1], x2 + pad)]
-                all_crops.append(v_crop)
-        else:
-            all_crops.append(h_crop)
 
-    result = all_crops if all_crops else [image]
-    log.info(f"  Segmented into {len(result)} card(s).")
-    return result
+def run_tesseract(processed):
+    if not TESSERACT_AVAILABLE:
+        return []
+    pil = Image.fromarray(processed)
+    pool = {}
+    for psm in [6, 11, 3]:
+        try:
+            data = pytesseract.image_to_data(
+                pil, config=f"--psm {psm} --oem 3", output_type=pytesseract.Output.DICT
+            )
+        except Exception:
+            continue
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text:
+                continue
+            raw_conf = data["conf"][i]
+            if isinstance(raw_conf, str):
+                raw_conf = (
+                    float(raw_conf) if raw_conf.strip() not in ("-1", "") else 0.0
+                )
+            conf = max(0.0, float(raw_conf) / 100.0)
+            x, y, w, h = (
+                data["left"][i],
+                data["top"][i],
+                data["width"][i],
+                data["height"][i],
+            )
+            if w < 4 or h < 4:
+                continue
+            bbox = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+            k = _bbox_key(bbox)
+            if k not in pool or conf > pool[k][2]:
+                pool[k] = (bbox, text, conf)
+    return list(pool.values())
+
+
+def merge_ocr(easy, tess):
+    merged = {}
+    for bbox, text, conf in easy + tess:
+        k = _bbox_key(bbox)
+        if k not in merged or conf > merged[k][2]:
+            merged[k] = (bbox, text, conf)
+    return list(merged.values())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — CONFIDENCE FILTER  (unchanged from v3.0)
+#  TOKEN CLEANING
 # ══════════════════════════════════════════════════════════════════════════════
+def collapse_spaced(text):
+    segs = text.strip().split()
+    if len(segs) >= 2 and all(re.fullmatch(r"[A-Za-z]\.?", s) for s in segs):
+        return "".join(segs)
+    return text
 
 
-def filter_by_confidence(ocr_results: list) -> list:
-    threshold = CONFIG["OCR_MIN_CONFIDENCE"]
-    filtered = [
-        (bbox, text.strip(), conf)
-        for bbox, text, conf in ocr_results
-        if conf >= threshold and text.strip()
-    ]
-    dropped = len(ocr_results) - len(filtered)
-    if dropped:
-        log.debug(f"  Confidence filter: dropped {dropped} token(s) below {threshold}.")
-    return filtered
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — OCR TEXT CLEANING  (unchanged from v3.0)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_LABEL_PREFIX_RE = re.compile(
-    r"^(Mob|Ph|Phone|Tel|Email|E-mail|Add|Address|Web|Website|"
-    r"URL|M|E|A|W|P|T)\s*[:\-]\s*",
-    flags=re.IGNORECASE,
+_DIGIT_MAP = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "I": "1",
+        "l": "1",
+        "S": "5",
+        "s": "5",
+        "B": "8",
+        "G": "6",
+        "g": "9",
+        "Z": "2",
+        "z": "2",
+    }
 )
 
 
-def clean_token(text: str) -> str:
-    text = _LABEL_PREFIX_RE.sub("", text).strip()
-    return correct_text(text)
+def fix_digits(text):
+    return text.translate(_DIGIT_MAP)
+
+
+def clean_text(text):
+    text = unicodedata.normalize("NFKC", text)
+    return re.sub(r" {2,}", " ", text).strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — FIELD EXTRACTORS
+#  LINE GROUPING
 # ══════════════════════════════════════════════════════════════════════════════
+def group_lines(tokens):
+    if not tokens:
+        return []
+    heights = [height_px(b) for b, _, _ in tokens]
+    med_h = float(np.median(heights)) if heights else 20
+    y_tol = max(LINE_Y_BASE_TOL, int(med_h * 0.65))
+    sorted_t = sorted(tokens, key=lambda r: (mid_y(r[0]), left_x(r[0])))
+    lines = []
+    current = [sorted_t[0]]
+    for item in sorted_t[1:]:
+        if abs(mid_y(item[0]) - mid_y(current[0][0])) <= y_tol:
+            current.append(item)
+        else:
+            lines.append(sorted(current, key=lambda r: left_x(r[0])))
+            current = [item]
+    lines.append(sorted(current, key=lambda r: left_x(r[0])))
+    return lines
 
 
-def _card_height_px(ocr_results: list) -> int:
-    if not ocr_results:
-        return 1
-    return max(int(bbox[2][1]) for bbox, _, _ in ocr_results) or 1
+def line_text(line, sep=" "):
+    parts = [collapse_spaced(clean_text(t)) for _, t, _ in line if t.strip()]
+    return sep.join(p for p in parts if p)
 
 
-def _fuzzy_contains(text: str, keyword_set: frozenset, cutoff: int = None) -> bool:
-    if cutoff is None:
-        cutoff = CONFIG["FUZZY_SCORE_CUTOFF"]
-    for word in text.lower().split():
-        if fuzz_process.extractOne(
-            word, keyword_set, scorer=fuzz.ratio, score_cutoff=cutoff
-        ):
-            return True
-    return False
+def line_conf(line):
+    return sum(c for _, _, c in line) / len(line) if line else 0.0
 
 
-# ── 13a  NAME ─────────────────────────────────────────────────────────────────
-# FIX-1 impact: After reconstruct_tokens(), "ADITYA V. VARMA" now arrives as a
-# single token so is_plausible_name() evaluates the full name, not "V .".
-#
-# NAME_ZONE_RATIO raised from 0.35 → 0.65 because centred-layout cards
-# (name in the middle) were excluded by the old top-35% constraint.
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIELD EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_email(lines):
+    hits = []
+    for line in lines:
+        full = re.sub(r"\s+", "", line_text(line))
+        m = _EMAIL_RE.search(full)
+        if m:
+            hits.append((line_conf(line), re.sub(r"\s+", "", m.group()).lower()))
+        for _, t, c in line:
+            t2 = re.sub(r"\s+", "", t)
+            m2 = _EMAIL_RE.search(t2)
+            if m2:
+                hits.append((c, re.sub(r"\s+", "", m2.group()).lower()))
+    return max(hits, key=lambda x: x[0])[1] if hits else ""
 
 
-def extract_name(ocr_results: list, card_height: int) -> tuple:
-    """
-    Extracts person name via spatial zone + linguistic filters.
-    See v3.0 for full algorithm description.
+def extract_phones(lines):
+    found = []
+    for line in lines:
+        txt = fix_digits(line_text(line))
+        for m in _PHONE_RE.finditer(txt):
+            raw = m.group()
+            digits = re.sub(r"\D", "", raw)
+            if PHONE_MIN_DIGITS <= len(digits) <= PHONE_MAX_DIGITS:
+                norm = re.sub(r"(?<=\d) (?=\d)", "", raw)
+                norm = re.sub(r"\s{2,}", " ", norm).strip()
+                if norm and norm not in found:
+                    found.append(norm)
+    return found
 
-    Changes in v4.0:
-      • NAME_ZONE_RATIO raised to 0.65 (centred cards supported)
-      • NAME_MAX_WORDS raised to 6
-      • Accepts reconstructed spaced-letter tokens from reconstruct_tokens()
-    """
-    name_zone_y = card_height * CONFIG["NAME_ZONE_RATIO"]
 
-    def is_plausible_name(text: str) -> bool:
-        words = text.strip().split()
-        if not (CONFIG["NAME_MIN_WORDS"] <= len(words) <= CONFIG["NAME_MAX_WORDS"]):
+def extract_website(lines):
+    for line in lines:
+        m = _WEB_RE.search(line_text(line))
+        if m:
+            url = m.group().strip()
+            return ("http://" + url if not url.startswith("http") else url).lower()
+    return ""
+
+
+def extract_name(lines, raw_tokens):
+    if not raw_tokens:
+        return ""
+    all_bottom_y = [top_y(b) + height_px(b) for b, _, _ in raw_tokens]
+    card_h = max(all_bottom_y) if all_bottom_y else 1
+
+    def _ok(bbox, text, conf):
+        if conf < OCR_CONF_THRESHOLD:
             return False
-        # Allow letters, spaces, hyphens, apostrophes, dots (initials like V.)
-        if not re.fullmatch(r"[A-Za-z\s\.\-\']+", text.strip()):
-            return False
-        text_lower = text.lower()
-        words_lower = text_lower.split()
-        if any(kw in words_lower for kw in JOB_TITLE_KEYWORDS):
-            return False
-        if any(kw in words_lower for kw in COMPANY_KEYWORDS):
-            return False
-        if any(kw in text_lower for kw in ADDRESS_KEYWORDS):
-            return False
-        if re.search(r"\.(com|in|org|net|co\.in)", text_lower):
-            return False
-        return True
-
-    buckets: dict = {
-        "zone_caps": [],
-        "zone_title": [],
-        "full_caps": [],
-        "full_title": [],
-    }
-
-    for bbox, text, conf in ocr_results:
-        text = text.strip()
-        if not is_plausible_name(text):
-            continue
-        top_y = bbox[0][1]
-        in_zone = top_y <= name_zone_y
-        words = text.split()
-        is_caps = text.isupper()
-        is_title = all(w[0].isupper() for w in words if len(w) > 1)
-
-        if in_zone and is_caps:
-            buckets["zone_caps"].append((text, conf))
-        elif in_zone and is_title:
-            buckets["zone_title"].append((text, conf))
-        elif is_caps:
-            buckets["full_caps"].append((text, conf))
-        elif is_title:
-            buckets["full_title"].append((text, conf))
-
-    for tier_name, tier in buckets.items():
-        if tier:
-            best_text, best_conf = max(tier, key=lambda x: x[1])
-            log.debug(f"  Name via [{tier_name}]: '{best_text}' ({best_conf:.2f})")
-            return best_text, best_conf
-
-    return "Unknown", 0.0
-
-
-# ── 13b  EMAIL ────────────────────────────────────────────────────────────────
-# FIX-2 impact: extract_email() now receives line_strings (assembled lines)
-# in addition to individual tokens, so multi-token email addresses like
-# "aditya.v @ urbanedgeinfra . co . in" are detected correctly.
-
-
-def extract_email(ocr_results: list, line_strings: list = None) -> tuple:
-    """
-    Extracts email address.
-
-    v4.0 change: accepts optional `line_strings` (from build_line_strings()).
-    Line-joined strings are searched first; individual tokens serve as fallback.
-    Both paths strip ALL internal whitespace before matching.
-    """
-    EMAIL_RE = re.compile(
-        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
-        re.IGNORECASE,
-    )
-    best_email, best_conf = "N/A", 0.0
-
-    # Primary: search line-joined strings (catches multi-token emails)
-    sources = []
-    if line_strings:
-        for ls in line_strings:
-            sources.append((ls["nospace"], ls["conf"]))
-
-    # Fallback / supplemental: individual tokens (catches single-token emails)
-    for _, text, conf in ocr_results:
-        sources.append((re.sub(r"\s+", "", text), conf))
-
-    for compact, conf in sources:
-        match = EMAIL_RE.search(compact)
-        if match and conf > best_conf:
-            best_email = match.group().lower()
-            best_conf = conf
-            log.debug(f"  Email found: '{best_email}' ({conf:.2f})")
-
-    return best_email, best_conf
-
-
-# ── 13c  PHONE  (unchanged from v3.0) ────────────────────────────────────────
-
-
-def extract_phone(ocr_results: list) -> tuple:
-    best_phone, best_conf = "N/A", 0.0
-    for _, text, conf in ocr_results:
-        digit_count = len(re.sub(r"\D", "", text))
-        if digit_count < 7:
-            continue
-        parsed = None
-        for attempt in [text, re.sub(r"[^\d\+]", "", text)]:
-            try:
-                parsed = phonenumbers.parse(attempt, CONFIG["DEFAULT_REGION"])
-                break
-            except NumberParseException:
-                continue
-        if parsed and phonenumbers.is_valid_number(parsed) and conf > best_conf:
-            best_phone = phonenumbers.format_number(parsed, PhoneNumberFormat.E164)
-            best_conf = conf
-            log.debug(f"  Phone: '{text}' → '{best_phone}' ({conf:.2f})")
-    return best_phone, best_conf
-
-
-# ── 13d  JOB TITLE  (unchanged from v3.0, but benefits from FIX-3) ───────────
-# FIX-3 impact: "FOUND ER" is now a single token "FOUNDER" before this
-# function is called, so the fuzzy keyword match succeeds.
-
-
-def extract_job_title(ocr_results: list) -> tuple:
-    best_title, best_conf = "N/A", 0.0
-    for _, text, conf in ocr_results:
-        if "@" in text or re.search(r"\d{4,}", text):
-            continue
-        if _fuzzy_contains(text, JOB_TITLE_KEYWORDS) and conf > best_conf:
-            best_title, best_conf = text.strip(), conf
-    return best_title, best_conf
-
-
-# ── 13e  COMPANY ──────────────────────────────────────────────────────────────
-# FIX-5: Multi-token company-name assembly
-# ─────────────────────────────────────────
-# Problem: "URBANEDGE INFRA SOLUTIONS LLP" may arrive as three tokens:
-#   "URBANEDGE INFRA"  |  "SOLUTIONS"  |  "LLP"
-# The old extractor only matched the token containing "solutions" or "llp",
-# not the full company name.
-#
-# Fix: once a company-keyword-bearing token is identified, walk backwards and
-# forwards along the same line (or adjacent lines in the top zone) to collect
-# neighbouring tokens and assemble the full company name.
-
-
-def extract_company(ocr_results: list, name: str, email: str, job_title: str) -> tuple:
-    """
-    Extracts the company name.
-
-    v4.0 additions:
-      FIX-5: After finding the anchor token (contains company keyword), the
-      function assembles adjacent same-line tokens to build the full name.
-    """
-    email_domain = ""
-    if email != "N/A" and "@" in email:
-        email_domain = email.split("@")[1].split(".")[0].lower()
-
-    # Sort by reading order for adjacency walks
-    sorted_r = sorted(
-        ocr_results, key=lambda r: (_bbox_mid_y(r[0]), _bbox_left_x(r[0]))
-    )
-
-    best_company, best_conf = "N/A", 0.0
-
-    for anchor_idx, (bbox, text, conf) in enumerate(sorted_r):
-        text = text.strip()
-        if not text:
-            continue
-        if "@" in text:
-            continue
-        if re.search(r"\d{4,}", text):
-            continue
-        if text.lower() == name.lower():
-            continue
-        if job_title != "N/A" and text.lower() == job_title.lower():
-            continue
-        if any(kw in text.lower() for kw in ADDRESS_KEYWORDS):
-            continue
-        if any(city in text.lower() for city in KNOWN_CITIES):
-            continue
-
-        words = set(text.lower().split())
-        if not words.intersection(COMPANY_KEYWORDS):
-            continue
-
-        # ── FIX-5: collect the full company name from adjacent tokens ────
-        # Walk left (backwards) on the same line to collect prefix tokens
-        left_parts = []
-        for k in range(anchor_idx - 1, -1, -1):
-            bb_k, tx_k, cf_k = sorted_r[k]
-            if not _on_same_line(bbox, bb_k):
-                break
-            tx_k = tx_k.strip()
-            if not tx_k or "@" in tx_k or re.search(r"\d{4,}", tx_k):
-                break
-            left_parts.insert(0, tx_k)
-
-        # Walk right (forwards) on the same line to collect suffix tokens
-        right_parts = []
-        for k in range(anchor_idx + 1, len(sorted_r)):
-            bb_k, tx_k, cf_k = sorted_r[k]
-            if not _on_same_line(bbox, bb_k):
-                break
-            tx_k = tx_k.strip()
-            if not tx_k or "@" in tx_k or re.search(r"\d{4,}", tx_k):
-                break
-            right_parts.append(tx_k)
-
-        full_company = " ".join(left_parts + [text] + right_parts).strip()
-
-        # Email domain confidence boost
-        adjusted_conf = conf
-        if (
-            email_domain
-            and fuzz.partial_ratio(email_domain, full_company.lower()) >= 75
-        ):
-            adjusted_conf = min(1.0, conf + 0.10)
-            log.debug(
-                f"  Company confidence boosted (email domain match): '{full_company}'"
-            )
-
-        if adjusted_conf > best_conf:
-            best_company, best_conf = full_company, adjusted_conf
-            log.debug(f"  Company assembled: '{full_company}' ({adjusted_conf:.2f})")
-
-    # Second pass: proper-noun fallback (unchanged from v3.0)
-    if best_company == "N/A":
-        name_seen = False
-        for _, text, conf in sorted_r:
-            text = text.strip()
-            if text == name:
-                name_seen = True
-                continue
-            if name_seen:
-                if (
-                    not re.search(r"\d", text)
-                    and not _fuzzy_contains(text, JOB_TITLE_KEYWORDS)
-                    and not any(kw in text.lower() for kw in ADDRESS_KEYWORDS)
-                    and 1 <= len(text.split()) <= 4
-                    and all(w[0].isupper() for w in text.split() if w)
-                ):
-                    best_company, best_conf = text, conf
-                    log.debug(f"  Company via second-pass proper noun: '{text}'")
-                    break
-
-    return best_company, best_conf
-
-
-# ── 13f  ADDRESS ──────────────────────────────────────────────────────────────
-# FIX-4 impact: by the time this function runs, city tokens like "Surt"/"Sure"
-# have already been corrected to "Surat" by correct_city_near_pin().
-# No logic change needed in this function.
-
-
-def extract_address(ocr_results: list) -> tuple:
-    PINCODE_RE = re.compile(r"\d{6}")
-    GLUED_RE = re.compile(r"([A-Za-z])(\d{6})")
-    seen = set()
-    fragments = []
-    confs = []
-
-    for _, text, conf in ocr_results:
         t = text.strip()
+        if len(t) < 2:
+            return False
+        if re.search(r"\d", t) or "@" in t:
+            return False
+        if _COMPANY_KW.search(t) or _TITLE_KW.search(t) or _ADDR_KW.search(t):
+            return False
+        return sum(c.isalpha() for c in t) / max(len(t), 1) >= 0.60
+
+    cands = [(b, t, c) for b, t, c in raw_tokens if _ok(b, t, c)]
+    if not cands:
+        return ""
+    cand_lines = group_lines(cands)
+
+    def _score(ln):
+        avg_h = float(np.mean([height_px(b) for b, _, _ in ln]))
+        avg_c = line_conf(ln)
+        avg_y = float(np.mean([top_y(b) for b, _, _ in ln]))
+        return avg_h * avg_c * (1 + 0.35 * (1.0 - avg_y / card_h))
+
+    best = max(cand_lines, key=_score)
+    parts = []
+    for _, t, _ in sorted(best, key=lambda r: left_x(r[0])):
+        p = collapse_spaced(clean_text(t))
+        if p.isupper() and len(p) > 2:
+            p = p.title()
+        parts.append(p)
+    name = " ".join(parts)
+    return re.sub(r"^[^A-Za-z]+|[^A-Za-z.'\-]+$", "", name).strip()
+
+
+def extract_company(lines):
+    scored = []
+    for line in lines:
+        t = line_text(line).strip()
         if not t:
             continue
-        t_lower = t.lower()
+        score = 0
+        if _COMPANY_KW.search(t):
+            score += 10
+        if t.isupper() and len(t.split()) >= 2:
+            score += 3
+        if len(t.split()) >= 2:
+            score += 1
+        if "@" in t or re.search(r"\d{4,}", t):
+            score -= 10
+        if _ADDR_KW.search(t):
+            score -= 5
+        if _TITLE_KW.search(t):
+            score -= 4
+        if score > 0:
+            scored.append((score, line_conf(line), t))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return scored[0][2]
 
-        has_addr_kw = any(kw in t_lower for kw in ADDRESS_KEYWORDS)
-        has_pincode = bool(PINCODE_RE.search(t))
-        has_city = bool(
-            fuzz_process.extractOne(
-                t_lower,
-                KNOWN_CITIES,
-                scorer=fuzz.partial_ratio,
-                score_cutoff=CONFIG["FUZZY_SCORE_CUTOFF"],
-            )
+
+def extract_job_title(lines):
+    for line in lines:
+        t = line_text(line).strip()
+        if _TITLE_KW.search(t) and not _COMPANY_KW.search(t):
+            return t
+    return ""
+
+
+def extract_address(lines):
+    parts = []
+    for line in lines:
+        t = line_text(line).strip()
+        if not t:
+            continue
+        is_addr = bool(_ADDR_KW.search(t))
+        if re.search(r"\b\d{4,9}\b", t) and not re.search(r"[+\-]\s*\d{6,}", t):
+            is_addr = True
+        if re.search(r"[A-Z][a-z]+,\s*[A-Z][a-z]+", t):
+            is_addr = True
+        if is_addr:
+            parts.append(t)
+    return ", ".join(parts) if parts else ""
+
+
+def extract_social(lines):
+    r = {"linkedin": "", "twitter": ""}
+    for line in lines:
+        t = line_text(line)
+        if not r["linkedin"]:
+            m = _LINKEDIN_RE.search(t)
+            if m:
+                r["linkedin"] = m.group().strip()
+        if not r["twitter"]:
+            m = _TWITTER_RE.search(t)
+            if m:
+                r["twitter"] = m.group().strip()
+    return r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FULL PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+def process_card(image_path, debug=False):
+    result = {
+        "file": image_path,
+        "name": "",
+        "job_title": "",
+        "company": "",
+        "email": "",
+        "phones": [],
+        "website": "",
+        "address": "",
+        "linkedin": "",
+        "twitter": "",
+        "_debug": {},
+    }
+    img = resize_for_ocr(load_image(image_path))
+    img, skew = deskew(img)
+    proc, is_dark, mode = preprocess_image(img)
+    if debug:
+        result["_debug"].update({"skew": round(skew, 2), "dark": is_dark, "mode": mode})
+        cv2.imwrite(
+            os.path.join(
+                os.path.dirname(os.path.abspath(image_path)),
+                "DEBUG_preprocessed_v5.png",
+            ),
+            proc,
         )
-
-        if not (has_addr_kw or has_pincode or has_city):
-            continue
-
-        cleaned = GLUED_RE.sub(r"\1 \2", t)
-        if cleaned.lower() in seen:
-            continue
-
-        seen.add(cleaned.lower())
-        fragments.append(cleaned)
-        confs.append(conf)
-
-    if not fragments:
-        return "N/A", 0.0
-
-    return " | ".join(fragments), float(np.mean(confs))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — EXTRACTION ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _quality_label(
-    name: str, phone: str, email: str, company: str, address: str
-) -> str:
-    """
-    FIX-6: quality label now uses the same N/A sentinel set as before but
-    no longer misclassifies records where the email is present but had
-    zero confidence (which only happened because of FIX-2 failures).
-    With FIX-2 in place, email extraction works so this function is correct.
-    Kept unchanged; improvement is automatic.
-    """
-    SENTINEL = {"N/A", "Unknown", ""}
-    filled = sum(
-        v.strip() not in SENTINEL for v in [name, phone, email, company, address]
-    )
-    if filled >= 5:
-        return "GREEN"
-    if filled >= 3:
-        return "YELLOW"
-    return "RED"
+    easy = run_easyocr(proc)
+    tess = run_tesseract(proc)
+    tokens = merge_ocr(easy, tess)
+    kept = [(b, t, c) for b, t, c in tokens if c >= OCR_CONF_THRESHOLD]
+    if debug:
+        result["_debug"]["total"] = len(tokens)
+        result["_debug"]["kept"] = len(kept)
+        result["_debug"]["raw"] = [
+            {"text": t, "conf": round(c, 3), "y": round(top_y(b), 1)}
+            for b, t, c in sorted(tokens, key=lambda r: top_y(r[0]))
+        ]
+    lines = group_lines(kept)
+    if debug:
+        result["_debug"]["lines"] = [
+            {"n": i + 1, "text": line_text(ln), "conf": round(line_conf(ln), 3)}
+            for i, ln in enumerate(lines)
+        ]
+    result["email"] = extract_email(lines)
+    result["phones"] = extract_phones(lines)
+    result["website"] = extract_website(lines)
+    result["name"] = extract_name(lines, kept)
+    result["company"] = extract_company(lines)
+    result["job_title"] = extract_job_title(lines)
+    result["address"] = extract_address(lines)
+    soc = extract_social(lines)
+    result["linkedin"] = soc["linkedin"]
+    result["twitter"] = soc["twitter"]
+    result["file"] = os.path.basename(image_path)
+    if debug:
+        _annotate(img, tokens, image_path)
+    return result
 
 
-def process_card(ocr_raw: list) -> dict:
-    """
-    Orchestrates all field extractors for one card.
-
-    v4.0 pipeline order:
-      1.  Confidence filter
-      2.  Token reconstruction   ← NEW: FIX-1 + FIX-3
-      3.  PIN↔city correction    ← NEW: FIX-4
-      4.  Clean tokens
-      5.  Build line strings     ← NEW: FIX-2
-      6.  Email (uses line strings)
-      7.  Phone
-      8.  Name
-      9.  Job title
-      10. Company (uses FIX-5 adjacency walk)
-      11. Address
-      12. Quality label
-    """
-    EMPTY = {
-        "Name": "Unknown",
-        "Phone": "N/A",
-        "Email": "N/A",
-        "Company": "N/A",
-        "Address": "N/A",
-        "Job_Title": "N/A",
-        "Quality": "RED",
-        "Name_Conf": 0.0,
-        "Phone_Conf": 0.0,
-        "Email_Conf": 0.0,
-    }
-
-    # Step 1 — Confidence filter
-    filtered = filter_by_confidence(ocr_raw)
-    if not filtered:
-        log.warning("  All OCR tokens below confidence threshold — card skipped.")
-        return EMPTY
-
-    # Step 2 — Token reconstruction (FIX-1 spaced-letter + FIX-3 split-word)
-    reconstructed = reconstruct_tokens(filtered)
-
-    # Step 3 — PIN↔city contextual correction (FIX-4)
-    pin_corrected = correct_city_near_pin(reconstructed)
-
-    # Step 4 — Clean tokens (label stripping + spell correction)
-    cleaned_results = []
-    for bbox, text, conf in pin_corrected:
-        cleaned = clean_token(text)
-        if cleaned:
-            cleaned_results.append((bbox, cleaned, conf))
-
-    if not cleaned_results:
-        log.warning("  No text remained after cleaning — card skipped.")
-        return EMPTY
-
-    # Step 5 — Build line strings (FIX-2)
-    line_strings = build_line_strings(cleaned_results)
-
-    card_h = _card_height_px(cleaned_results)
-    log.debug(
-        f"  Card height: {card_h}px | "
-        f"Name zone ≤ {card_h * CONFIG['NAME_ZONE_RATIO']:.0f}px"
-    )
-
-    # Steps 6–11 — Field extraction
-    email, email_conf = extract_email(cleaned_results, line_strings)
-    phone, phone_conf = extract_phone(cleaned_results)
-    name, name_conf = extract_name(cleaned_results, card_h)
-    job_title, _ = extract_job_title(cleaned_results)
-    company, _ = extract_company(cleaned_results, name, email, job_title)
-    address, _ = extract_address(cleaned_results)
-
-    # Step 12 — Quality label
-    quality = _quality_label(name, phone, email, company, address)
-
-    log.info(
-        f"  Name: {name!r:<22} Phone: {phone:<18} "
-        f"Email: {email:<35} Company: {company!r:<28} Quality: {quality}"
-    )
-
-    return {
-        "Name": name,
-        "Phone": phone,
-        "Email": email,
-        "Company": company,
-        "Address": address,
-        "Job_Title": job_title,
-        "Quality": quality,
-        "Name_Conf": round(name_conf, 2),
-        "Phone_Conf": round(phone_conf, 2),
-        "Email_Conf": round(email_conf, 2),
-    }
+def _annotate(img, tokens, src):
+    ann = img.copy()
+    for bbox, text, conf in tokens:
+        pts = np.array([[int(p[0]), int(p[1])] for p in bbox], np.int32)
+        color = (0, 200, 0) if conf >= OCR_CONF_THRESHOLD else (0, 0, 200)
+        cv2.polylines(ann, [pts], True, color, 2)
+        label = f"{text[:24]}{'…' if len(text)>24 else ''} [{conf:.2f}]"
+        pos = (max(pts[0][0], 0), max(pts[0][1] - 5, 12))
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        cv2.rectangle(
+            ann, (pos[0], pos[1] - lh - 2), (pos[0] + lw, pos[1] + 2), (20, 20, 20), -1
+        )
+        cv2.putText(
+            ann, label, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA
+        )
+    out = os.path.join(os.path.dirname(os.path.abspath(src)), "DEBUG_annotated_v5.png")
+    cv2.imwrite(out, ann)
+    print(f"  [DEBUG] Annotated → {out}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — POPPLER AUTO-DETECTION  (unchanged from v3.0)
+#  TERMINAL OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
+def print_result(r):
+    w = 60
+    print()
+    print("═" * w)
+    print(f"  FILE      : {r['file']}")
+    print("─" * w)
+    print(f"  NAME      : {r['name']      or '—'}")
+    print(f"  JOB TITLE : {r['job_title'] or '—'}")
+    print(f"  COMPANY   : {r['company']   or '—'}")
+    print(f"  EMAIL     : {r['email']     or '—'}")
+    for i, ph in enumerate(r["phones"], 1):
+        print(f"  PHONE {'#'+str(i):<4}: {ph}")
+    if not r["phones"]:
+        print(f"  PHONE     : —")
+    print(f"  WEBSITE   : {r['website']   or '—'}")
+    print(f"  ADDRESS   : {r['address']   or '—'}")
+    print(f"  LINKEDIN  : {r['linkedin']  or '—'}")
+    print(f"  TWITTER/X : {r['twitter']   or '—'}")
+    print("═" * w)
+    if r.get("_debug"):
+        d = r["_debug"]
+        print(
+            f"\n  [DEBUG] skew={d.get('skew')}°  dark={d.get('dark')}  mode={d.get('mode')}"
+        )
+        print(f"  [DEBUG] tokens total={d.get('total')}  kept={d.get('kept')}")
+        print("\n  RAW TOKENS:")
+        for tk in d.get("raw", []):
+            mark = "  " if tk["conf"] >= OCR_CONF_THRESHOLD else "✗ "
+            print(f"  {mark}y={tk['y']:>6.1f}  conf={tk['conf']:.3f}  {tk['text']!r}")
+        print("\n  GROUPED LINES:")
+        for ln in d.get("lines", []):
+            print(f"  Line {ln['n']:02d} (conf={ln['conf']:.2f}) : {ln['text']!r}")
+        print()
 
 
-def resolve_poppler_path():
-    if CONFIG["POPPLER_PATH"]:
-        return CONFIG["POPPLER_PATH"]
-    windows_candidates = [
-        r"C:\poppler\Library\bin",
-        r"C:\Program Files\poppler\Library\bin",
-        r"C:\Program Files (x86)\poppler\bin",
-        r"C:\poppler\bin",
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAVE — JSON
+# ══════════════════════════════════════════════════════════════════════════════
+def _ts():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def save_json(results, out_dir):
+    path = os.path.join(out_dir, f"cards_{_ts()}.json")
+    clean = [{k: v for k, v in r.items() if k != "_debug"} for r in results]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False)
+    print(f"  [JSON] → {path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAVE — EXCEL  (replaces CSV)
+# ══════════════════════════════════════════════════════════════════════════════
+def save_excel(results, out_dir):
+    if not OPENPYXL_AVAILABLE:
+        print(
+            "  [WARN] openpyxl missing — skipping Excel export (pip install openpyxl)"
+        )
+        return
+
+    path = os.path.join(out_dir, f"cards_{_ts()}.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Visiting Cards"
+
+    # ── palette ───────────────────────────────────────────────────────────────
+    C_HEADER_BG = "1F4E79"  # deep navy
+    C_HEADER_FG = "FFFFFF"  # white
+    C_ROW_ODD = "EBF3FB"  # light blue tint
+    C_ROW_EVEN = "FFFFFF"  # white
+    C_BORDER = "BDD7EE"  # soft blue border
+    C_ACCENT_FG = "1F4E79"  # navy text for data
+
+    thin = Side(style="thin", color=C_BORDER)
+    bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── columns ───────────────────────────────────────────────────────────────
+    COLS = [
+        ("File", "file", 28),
+        ("Name", "name", 22),
+        ("Job Title", "job_title", 30),
+        ("Company", "company", 28),
+        ("Email", "email", 32),
+        ("Phone 1", "phone_1", 20),
+        ("Phone 2", "phone_2", 20),
+        ("Website", "website", 30),
+        ("Address", "address", 40),
+        ("LinkedIn", "linkedin", 35),
+        ("Twitter/X", "twitter", 22),
     ]
-    for path in windows_candidates:
-        if os.path.isdir(path):
-            log.info(f"  Poppler auto-detected: {path}")
-            return path
-    return None
+
+    # ── header row ────────────────────────────────────────────────────────────
+    header_fill = PatternFill("solid", fgColor=C_HEADER_BG)
+    header_font = Font(name="Arial", bold=True, color=C_HEADER_FG, size=11)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    for col_idx, (label, _, _) in enumerate(COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=label)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+        cell.border = bdr
+
+    ws.row_dimensions[1].height = 22
+
+    # ── data rows ─────────────────────────────────────────────────────────────
+    data_font = Font(name="Arial", size=10, color=C_ACCENT_FG)
+    data_align = Alignment(vertical="center", wrap_text=False)
+
+    for row_idx, r in enumerate(results, start=2):
+        ph = r.get("phones", [])
+        row_bg = C_ROW_ODD if row_idx % 2 == 0 else C_ROW_EVEN
+        row_fill = PatternFill("solid", fgColor=row_bg)
+
+        values = {
+            "file": r.get("file", ""),
+            "name": r.get("name", ""),
+            "job_title": r.get("job_title", ""),
+            "company": r.get("company", ""),
+            "email": r.get("email", ""),
+            "phone_1": ph[0] if ph else "",
+            "phone_2": ph[1] if len(ph) > 1 else "",
+            "website": r.get("website", ""),
+            "address": r.get("address", ""),
+            "linkedin": r.get("linkedin", ""),
+            "twitter": r.get("twitter", ""),
+        }
+
+        for col_idx, (_, key, _) in enumerate(COLS, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=values[key])
+            cell.fill = row_fill
+            cell.font = data_font
+            cell.alignment = data_align
+            cell.border = bdr
+
+        ws.row_dimensions[row_idx].height = 18
+
+    # ── column widths ─────────────────────────────────────────────────────────
+    for col_idx, (_, _, width) in enumerate(COLS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # ── freeze header + auto-filter ───────────────────────────────────────────
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # ── print settings ────────────────────────────────────────────────────────
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_view.showGridLines = False
+
+    wb.save(path)
+    print(f"  [XLSX] → {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — EXCEL OUTPUT  (unchanged from v3.0)
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".heic"}
 
 
-def save_to_excel(records: list, output_path: str) -> None:
-    COLUMN_ORDER = [
-        "Filename",
-        "Card",
-        "Name",
-        "Phone",
-        "Email",
-        "Company",
-        "Address",
-        "Job_Title",
-        "Quality",
-        "Name_Conf",
-        "Phone_Conf",
-        "Email_Conf",
-    ]
-    df = pd.DataFrame(records)[COLUMN_ORDER]
-
-    QUALITY_FILLS = {
-        "GREEN": PatternFill("solid", fgColor="C6EFCE"),
-        "YELLOW": PatternFill("solid", fgColor="FFEB9C"),
-        "RED": PatternFill("solid", fgColor="FFC7CE"),
-    }
-    HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
-    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-    HEADER_ALIGN = Alignment(horizontal="center", vertical="center")
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Visiting Cards")
-        ws = writer.sheets["Visiting Cards"]
-
-        for cell in ws[1]:
-            cell.fill = HEADER_FILL
-            cell.font = HEADER_FONT
-            cell.alignment = HEADER_ALIGN
-
-        quality_col_idx = COLUMN_ORDER.index("Quality") + 1
-        for row_idx, quality_val in enumerate(df["Quality"], start=2):
-            fill = QUALITY_FILLS.get(str(quality_val), PatternFill())
-            ws.cell(row=row_idx, column=quality_col_idx).fill = fill
-
-        for col_cells in ws.columns:
-            max_len = max(
-                (len(str(c.value)) for c in col_cells if c.value is not None),
-                default=10,
-            )
-            ws.column_dimensions[get_column_letter(col_cells[0].column)].width = min(
-                max_len + 4, 60
-            )
-        ws.freeze_panes = "A2"
-
-    log.info(f"  Excel saved → {os.path.abspath(output_path)}")
+def collect_paths(target):
+    p = Path(target)
+    if p.is_file():
+        return [str(p)]
+    if p.is_dir():
+        return sorted(str(f) for f in p.iterdir() if f.suffix.lower() in _IMG_EXTS)
+    return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — SINGLE CARD PROCESSOR  (unchanged from v3.0)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def process_single_card(card_img: np.ndarray, reader: easyocr.Reader, card_label: str):
+def gui_pick():
     try:
-        processed = preprocess_image(card_img)
-        ocr_raw = reader.readtext(processed, width_ths=CONFIG["OCR_WIDTH_THRESHOLD"])
+        from tkinter import Tk, filedialog
 
-        log.debug(f"  Raw OCR: {len(ocr_raw)} token(s)")
-        for bbox, text, conf in ocr_raw:
-            log.debug(f"    [{conf:.2f}] {text!r}")
-
-        if not filter_by_confidence(ocr_raw):
-            log.warning(
-                f"  [{card_label}] No confident tokens — retrying with contrast-boost."
-            )
-            gray = cv2.cvtColor(card_img, cv2.COLOR_BGR2GRAY)
-            fallback = cv2.convertScaleAbs(
-                gray, alpha=CONFIG["CONTRAST_ALPHA"], beta=CONFIG["CONTRAST_BETA"]
-            )
-            ocr_raw = reader.readtext(fallback, width_ths=CONFIG["OCR_WIDTH_THRESHOLD"])
-
-        return process_card(ocr_raw)
-
-    except Exception as exc:
-        log.error(f"  [{card_label}] Processing exception: {exc}")
-        log.debug(traceback.format_exc())
-        return None
+        root = Tk()
+        root.withdraw()
+        paths = filedialog.askopenfilenames(
+            title="Select Visiting Card Image(s)",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tiff *.tif *.webp")],
+        )
+        root.destroy()
+        return list(paths)
+    except Exception:
+        print("  [WARN] Tkinter not available. Pass the image path as a CLI arg.")
+        return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — MAIN  (unchanged from v3.0)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def main() -> None:
-    log.info("=" * 70)
-    log.info("  VISITING CARD OCR EXTRACTOR — ULTIMATE BUILD v4.0")
-    log.info("=" * 70)
-
-    use_gpu = torch.cuda.is_available()
-    if use_gpu:
-        torch.backends.cudnn.benchmark = True
-        log.info("  GPU: ENABLED (cuDNN benchmark active)")
-    else:
-        log.info("  GPU: DISABLED — CPU mode")
-
-    root = Tk()
-    root.withdraw()
-    file_paths = filedialog.askopenfilenames(
-        title="Select Visiting Card Files",
-        filetypes=[("Supported files", "*.jpg *.jpeg *.png *.pdf *.tiff *.tif *.bmp")],
+def main():
+    ap = argparse.ArgumentParser(description="Visiting Card OCR Extractor v5.0")
+    ap.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Image file or folder (blank → GUI picker)",
     )
-    root.destroy()
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--no-json", action="store_true")
+    ap.add_argument("--no-xlsx", action="store_true")
+    args = ap.parse_args()
 
-    if not file_paths:
-        log.error("No files selected. Exiting.")
-        return
+    paths = collect_paths(args.target) if args.target else gui_pick()
+    if not paths:
+        print("  No images found. Exiting.")
+        sys.exit(0 if not args.target else 1)
 
-    log.info(f"  {len(file_paths)} file(s) selected.")
-    log.info("  Loading EasyOCR model...")
-    reader = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
-    log.info("  EasyOCR ready.")
+    print(f"\n  {len(paths)} image(s) to process.\n")
+    results = []
+    out_dir = os.path.dirname(os.path.abspath(paths[0]))
 
-    poppler_path = resolve_poppler_path()
-    all_results = []
-    total_cards = 0
-    failed_cards = 0
-
-    for file_path in file_paths:
-        filename = os.path.basename(file_path)
-        log.info(f"\n{'─' * 60}")
-        log.info(f"  File: {filename}")
-
+    for i, path in enumerate(paths, 1):
+        print(f"  [{i}/{len(paths)}] {os.path.basename(path)}")
         try:
-            ext = Path(file_path).suffix.lower()
-            if ext == ".pdf":
-                pdf_kwargs = {"dpi": CONFIG["PDF_DPI"]}
-                if poppler_path:
-                    pdf_kwargs["poppler_path"] = poppler_path
-                pages = convert_from_path(file_path, **pdf_kwargs)
-                images = [cv2.cvtColor(np.array(p), cv2.COLOR_RGB2BGR) for p in pages]
-                log.info(f"  PDF: {len(images)} page(s).")
-            else:
-                raw = cv2.imread(file_path)
-                if raw is None:
-                    raise IOError(f"OpenCV could not read '{file_path}'.")
-                images = [raw]
+            r = process_card(path, debug=args.debug)
+            print_result(r)
+            results.append(r)
+        except Exception as e:
+            print(f"  [ERROR] {path}: {e}")
+            if args.debug:
+                import traceback
 
-        except Exception as exc:
-            log.error(f"  SKIPPED — Failed to load '{filename}': {exc}")
-            all_results.append(
-                {
-                    "Filename": filename,
-                    "Card": "N/A",
-                    "Name": "FILE LOAD ERROR",
-                    "Phone": "N/A",
-                    "Email": "N/A",
-                    "Company": "N/A",
-                    "Address": "N/A",
-                    "Job_Title": "N/A",
-                    "Quality": "RED",
-                    "Name_Conf": 0.0,
-                    "Phone_Conf": 0.0,
-                    "Email_Conf": 0.0,
-                }
-            )
-            continue
+                traceback.print_exc()
 
-        for page_idx, full_page in enumerate(images):
-            if full_page is None:
-                continue
+    if results:
+        if not args.no_json:
+            save_json(results, out_dir)
+        if not args.no_xlsx:
+            save_excel(results, out_dir)
 
-            try:
-                card_crops = segment_cards(full_page)
-            except Exception as exc:
-                log.error(f"  Segmentation failed on page {page_idx + 1}: {exc}")
-                card_crops = [full_page]
-
-            for card_idx, card_crop in enumerate(card_crops):
-                total_cards += 1
-                card_label = f"P{page_idx + 1}_C{card_idx + 1}"
-                log.info(f"  Card [{card_label}]")
-
-                result = process_single_card(card_crop, reader, card_label)
-
-                if result is None:
-                    failed_cards += 1
-                    all_results.append(
-                        {
-                            "Filename": filename,
-                            "Card": card_label,
-                            "Name": "PROCESSING ERROR",
-                            "Phone": "N/A",
-                            "Email": "N/A",
-                            "Company": "N/A",
-                            "Address": "N/A",
-                            "Job_Title": "N/A",
-                            "Quality": "RED",
-                            "Name_Conf": 0.0,
-                            "Phone_Conf": 0.0,
-                            "Email_Conf": 0.0,
-                        }
-                    )
-                else:
-                    all_results.append(
-                        {
-                            "Filename": filename,
-                            "Card": card_label,
-                            "Name": result["Name"],
-                            "Phone": result["Phone"],
-                            "Email": result["Email"],
-                            "Company": result["Company"],
-                            "Address": result["Address"],
-                            "Job_Title": result["Job_Title"],
-                            "Quality": result["Quality"],
-                            "Name_Conf": result["Name_Conf"],
-                            "Phone_Conf": result["Phone_Conf"],
-                            "Email_Conf": result["Email_Conf"],
-                        }
-                    )
-
-    if not all_results:
-        log.error("No data extracted. Nothing to save.")
-        return
-
-    save_to_excel(all_results, CONFIG["OUTPUT_FILENAME"])
-
-    green = sum(r["Quality"] == "GREEN" for r in all_results)
-    yellow = sum(r["Quality"] == "YELLOW" for r in all_results)
-    red = sum(r["Quality"] == "RED" for r in all_results)
-
-    log.info(f"\n{'=' * 70}")
-    log.info(f"  COMPLETE — {total_cards} card(s) processed, {failed_cards} failed.")
-    log.info(f"  Quality → GREEN: {green} | YELLOW: {yellow} | RED: {red}")
-    log.info(f"  Output  : {os.path.abspath(CONFIG['OUTPUT_FILENAME'])}")
-    log.info(f"  Log     : {os.path.abspath(CONFIG['LOG_FILENAME'])}")
-    log.info(f"{'=' * 70}")
+    print("\n  Done.")
 
 
 if __name__ == "__main__":
