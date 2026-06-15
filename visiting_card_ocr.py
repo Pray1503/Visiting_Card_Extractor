@@ -2982,7 +2982,7 @@ def group_tokens_into_rows(tokens: Sequence[OCRToken]) -> list[list[OCRToken]]:
         return []
     ordered = sorted(tokens, key=lambda t: (t.cy, t.x1))
     median_height = statistics.median([t.height for t in ordered]) if ordered else 12.0
-    y_threshold = max(2.5, median_height * 0.62)
+    y_threshold = max(2.5, median_height * 0.45)
 
     rows: list[list[OCRToken]] = []
     current: list[OCRToken] = []
@@ -3024,6 +3024,7 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
 
     ordered = sorted(row, key=lambda t: t.x1)
     char_median = _row_char_width_median(ordered)
+
     parts: list[str] = []
     previous: OCRToken | None = None
 
@@ -3031,6 +3032,7 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
         token_text = _strip_trailing_punct(
             _fix_digit_substitutions(_safe_text(token.text).strip())
         )
+
         if not token_text:
             continue
 
@@ -3040,12 +3042,14 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
             continue
 
         gap = token.x1 - previous.x2
+
         prev_text = _strip_trailing_punct(
             _fix_digit_substitutions(_safe_text(previous.text).strip())
         )
+
         prev_is_fragment = len(prev_text) <= 2 or len(token_text) <= 2
 
-        if gap <= char_median * 0.8:
+        if gap <= char_median * 0.45:
             if prev_is_fragment:
                 parts[-1] = parts[-1] + token_text
             else:
@@ -3060,19 +3064,24 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
         previous = token
 
     text = _normalize_spaces(" ".join(parts))
+
     if len(text.split()) > 1 and all(len(piece) == 1 for piece in text.split()):
         text = text.replace(" ", "")
+
     return _strip_trailing_punct(text)
 
 
 def build_layout_lines(tokens: Sequence[OCRToken]) -> list[LayoutLine]:
     lines: list[LayoutLine] = []
+
     for row in group_tokens_into_rows(tokens):
         xs = [t.x1 for t in row] + [t.x2 for t in row]
         ys = [t.y1 for t in row] + [t.y2 for t in row]
+
         text = compose_row_text(row)
         char_median = _row_char_width_median(row)
         passes = tuple(sorted({t.pass_name for t in row}))
+
         lines.append(
             LayoutLine(
                 text=text,
@@ -3086,6 +3095,7 @@ def build_layout_lines(tokens: Sequence[OCRToken]) -> list[LayoutLine]:
                 source_passes=passes,
             )
         )
+
     return lines
 
 
@@ -3123,16 +3133,33 @@ def merge_multiline_blocks(lines: Sequence[LayoutLine]) -> list[LayoutBlock]:
         # NEW RULE:
         # only merge if horizontally aligned
 
-        if same_band and height_symmetry and overlap_ratio > 0.55:
+        current_text = current[-1].text.lower()
+        line_text = line.text.lower()
+
+        contains_email = "@" in current_text or "@" in line_text
+
+        contains_company = _has_hint(current_text, COMPANY_HINTS) or _has_hint(
+            line_text, COMPANY_HINTS
+        )
+
+        contains_title = _has_hint(current_text, JOB_HINTS) or _has_hint(
+            line_text, JOB_HINTS
+        )
+
+        safe_to_merge = same_band and height_symmetry and overlap_ratio > 0.55
+
+        if safe_to_merge and not (
+            contains_email or (contains_company and contains_title)
+        ):
             current.append(line)
         else:
             blocks.append(_block_from_lines(current))
             current = [line]
 
-    if current:
-        blocks.append(_block_from_lines(current))
+        if current:
+            blocks.append(_block_from_lines(current))
 
-    return blocks
+        return blocks
 
 
 def _block_from_lines(lines: Sequence[LayoutLine]) -> LayoutBlock:
@@ -3565,6 +3592,7 @@ def extract_job_title(
     excluded = {_canonical_for_compare(company_text), _canonical_for_compare(name_text)}
 
     for block in blocks:
+
         text = _strip_trailing_punct(block.text)
         if not text or _canonical_for_compare(text) in excluded:
             continue
