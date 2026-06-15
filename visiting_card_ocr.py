@@ -3460,6 +3460,7 @@ def extract_name(
     phone_text: str,
 ) -> FieldValue:
     candidates: list[tuple[float, str, str]] = []
+
     excluded = {
         _canonical_for_compare(title_text),
         _canonical_for_compare(company_text),
@@ -3470,22 +3471,49 @@ def extract_name(
     for idx, line in enumerate(sorted(lines, key=lambda ln: (ln.y1, ln.x1))):
         text = _strip_trailing_punct(line.text)
         canonical = _canonical_for_compare(text)
+
         if not text or canonical in excluded:
             continue
+
+        # Reject obvious company names
+        if any(
+            word in text.lower()
+            for word in (
+                "ltd",
+                "limited",
+                "llp",
+                "inc",
+                "corp",
+                "corporation",
+                "company",
+                "group",
+                "gmbh",
+                "pte",
+                "s.a.",
+                "spa",
+            )
+        ):
+            continue
+
         if not _looks_like_name(text):
             continue
+
         score = 0.0
+
         score += 30.0 if len(text.split()) in {2, 3} else 12.0
         score += 18.0 if text == text.title() else 10.0
         score += 10.0 if idx <= 2 else 2.0
         score += _alpha_ratio(text) * 15.0
+
         candidates.append((score, text, line.text))
 
     if not candidates:
         return FieldValue()
 
     candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+
     score, value, evidence = candidates[0]
+
     return FieldValue(
         value=value,
         confidence=min(0.99, 0.4 + score / 100.0),
