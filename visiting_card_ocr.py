@@ -3043,13 +3043,9 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
         prev_text = _strip_trailing_punct(
             _fix_digit_substitutions(_safe_text(previous.text).strip())
         )
-        prev_is_fragment = (
-            len(prev_text) <= 3
-            or len(token_text) <= 3
-            or (prev_text.isupper() and token_text.isupper())
-        )
+        prev_is_fragment = len(prev_text) <= 2 or len(token_text) <= 2
 
-        if gap <= char_median * 1.5:
+        if gap <= char_median * 0.8:
             if prev_is_fragment:
                 parts[-1] = parts[-1] + token_text
             else:
@@ -3098,21 +3094,36 @@ def merge_multiline_blocks(lines: Sequence[LayoutLine]) -> list[LayoutBlock]:
         return []
 
     ordered = sorted(lines, key=lambda ln: (ln.y1, ln.x1))
-    median_height = (
-        statistics.median([ln.height for ln in ordered]) if ordered else 12.0
-    )
-    merge_gap = max(2.0, median_height * 0.62)
+
+    median_height = statistics.median([ln.height for ln in ordered])
+
+    merge_gap = max(2.0, median_height * 0.35)
+
     blocks: list[LayoutBlock] = []
-    current: list[LayoutLine] = [ordered[0]]
+
+    current = [ordered[0]]
 
     for line in ordered[1:]:
         prev = current[-1]
+
         gap = line.y1 - prev.y2
+
         height_symmetry = (
-            abs(line.height - prev.height) <= max(line.height, prev.height) * 0.30
+            abs(line.height - prev.height) <= max(line.height, prev.height) * 0.25
         )
+
+        horizontal_overlap = min(line.x2, prev.x2) - max(line.x1, prev.x1)
+
+        overlap_ratio = horizontal_overlap / max(
+            1.0, min(line.x2 - line.x1, prev.x2 - prev.x1)
+        )
+
         same_band = gap <= merge_gap
-        if same_band and height_symmetry:
+
+        # NEW RULE:
+        # only merge if horizontally aligned
+
+        if same_band and height_symmetry and overlap_ratio > 0.55:
             current.append(line)
         else:
             blocks.append(_block_from_lines(current))
@@ -3375,8 +3386,19 @@ def extract_address(address_lines: Sequence[LayoutLine]) -> FieldValue:
         return FieldValue()
 
     sorted_lines = sorted(address_lines, key=lambda ln: (ln.y1, ln.x1))
-    text = _normalize_spaces(", ".join(line.text for line in sorted_lines if line.text))
+
+    cleaned = []
+
+    for line in sorted_lines:
+        txt = URL_RE.sub("", line.text)
+        txt = txt.strip()
+
+        if txt:
+            cleaned.append(txt)
+
+    text = _normalize_spaces(", ".join(cleaned))
     text = _strip_trailing_punct(text)
+
     return FieldValue(
         value=text,
         confidence=0.9,
@@ -3468,25 +3490,66 @@ def extract_company(
         _canonical_for_compare(address_text),
     }
 
+    company_suffixes = (
+        "LIMITED",
+        "LTD",
+        "LLP",
+        "INC",
+        "CORP",
+        "GROUP",
+        "GMBH",
+        "S.P.A",
+        "PTE",
+    )
+
     for idx, line in enumerate(sorted(lines, key=lambda ln: (ln.y1, ln.x1))):
         text = _strip_trailing_punct(line.text)
         canonical = _canonical_for_compare(text)
+
+        # Never allow emails to become companies
+        if "@" in text:
+            continue
+
+        # Never allow websites to become companies
+        if "www." in text.lower() or "http" in text.lower():
+            continue
+
         if not text or canonical in excluded:
             continue
+
         if not _looks_like_company(text):
             continue
+
         score = 0.0
+
         score += 28.0 if _has_hint(text.lower(), COMPANY_HINTS) else 8.0
         score += 18.0 if text.isupper() else 9.0
+
+        # Strong boost for common company suffixes
+        if any(suffix in text.upper() for suffix in company_suffixes):
+            score += 25.0
+
+        # Penalize person-like names
+        words = text.split()
+        if (
+            len(words) <= 4
+            and all(word.replace(".", "").isalpha() for word in words)
+            and not any(suffix in text.upper() for suffix in company_suffixes)
+        ):
+            score -= 15.0
+
         score += 8.0 if idx <= 2 else 3.0
         score += _alpha_ratio(text) * 14.0
+
         candidates.append((score, text, line.text))
 
     if not candidates:
         return FieldValue()
 
     candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+
     score, value, evidence = candidates[0]
+
     return FieldValue(
         value=value,
         confidence=min(0.99, 0.35 + score / 100.0),
