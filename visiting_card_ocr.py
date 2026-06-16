@@ -3064,7 +3064,6 @@ def compose_row_text(row: Sequence[OCRToken]) -> str:
         previous = token
 
     text = _normalize_spaces(" ".join(parts))
-
     if len(text.split()) > 1 and all(len(piece) == 1 for piece in text.split()):
         text = text.replace(" ", "")
 
@@ -4205,28 +4204,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Deterministic business card OCR engine v19.0"
     )
+
     parser.add_argument(
-        "input", nargs="?", type=Path, help="Image, PDF, ZIP, or directory to process"
+        "input",
+        nargs="*",
+        type=Path,
+        help="Image, PDF, ZIP, or directory to process",
     )
+
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("output"), help="Output directory"
+        "--output-dir",
+        type=Path,
+        default=Path("output"),
+        help="Output directory",
     )
-    parser.add_argument("--lang", default="en", help="PaddleOCR language code")
+
     parser.add_argument(
-        "--pretty", action="store_true", help="Pretty-print JSON records"
+        "--lang",
+        default="en",
+        help="PaddleOCR language code",
     )
+
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Pretty-print JSON records",
+    )
+
     return parser
 
 
-# some existing functions
-
-
-def select_input_file():
+def select_input_files():
     root = tk.Tk()
     root.withdraw()
 
-    file_path = filedialog.askopenfilename(
-        title="Select Business Card",
+    file_paths = filedialog.askopenfilenames(
+        title="Select Business Cards",
         filetypes=[
             ("Supported Files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.pdf *.zip"),
             ("All Files", "*.*"),
@@ -4234,26 +4247,40 @@ def select_input_file():
     )
 
     root.destroy()
-    return file_path
+    return list(file_paths)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    if args.input is None:
-        selected_file = select_input_file()
+    if not args.input:
+        selected_files = select_input_files()
 
-        if not selected_file:
-            print("No file selected.")
+        if not selected_files:
+            print("No files selected.")
             return 0
 
-        args.input = Path(selected_file)
+        args.input = [Path(f) for f in selected_files]
 
-    records = run_engine_on_source(args.input, args.output_dir, lang=args.lang)
+    all_records: list[dict] = []
 
-    for record in records:
-        print(json.dumps(record, indent=2 if args.pretty else None, ensure_ascii=False))
+    for source in args.input:
+        records = run_engine_on_source(
+            source,
+            args.output_dir,
+            lang=args.lang,
+        )
+        all_records.extend(records)
+
+    for record in all_records:
+        print(
+            json.dumps(
+                record,
+                indent=2 if args.pretty else None,
+                ensure_ascii=False,
+            )
+        )
 
     return 0
 
