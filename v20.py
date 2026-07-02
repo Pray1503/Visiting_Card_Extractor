@@ -26,6 +26,7 @@ v20 Architectural Advances over v19:
 """
 
 import os
+from pydoc import text
 import sys
 import re
 import json
@@ -39,7 +40,6 @@ from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any, Set
-from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
 import cv2
@@ -49,8 +49,26 @@ import phonenumbers
 from phonenumbers import PhoneNumberMatcher, PhoneNumberFormat
 from rapidfuzz import fuzz
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+from core.config import (
+    CFG,
+    IMAGE_EXTENSIONS,
+    EXCEL_COLS,
+    _QUALITY_COLOUR,
+    _THIN_BORDER,
+    _EMAIL_RE,
+    _WEB_RE,
+    _PHONE_DIGITS_RE,
+    _SOCIAL_PREFIX_RE,
+    _AT_HANDLE_RE,
+    _POSTAL_SHAPE_RE,
+    _ADDR_SEPARATOR_RE,
+)
+from core.models import OCRToken, TextRow, ContactCard
+from imaging import deskew, preprocess, segment_cards
+from ocr import ocr_card, detect_scripts
 
 warnings.filterwarnings("ignore")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -74,375 +92,14 @@ log = logging.getLogger("VC_OCR_v20")
 # ══════════════════════════════════════════════════════════════════════════════
 #  SYSTEM CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-CFG = {
-    # OCR
-    "OCR_CONF_THRESH": 0.18,
-    "PDF_DPI": 250,
-    # Segmentation
-    "SEG_MIN_AREA_FRAC": 0.03,
-    "SEG_MAX_AREA_FRAC": 0.95,
-    "SEG_PAD_PX": 12,
-    "SEG_CARD_ASPECT_MIN": 0.5,
-    "SEG_CARD_ASPECT_MAX": 5.0,
-    # Token Reconstruction Graph (TRG)
-    "TRG_GAP_SIGMA_MULTIPLIER": 2.2,  # Max gap = median_char_width * sigma_mult
-    "TRG_OVERLAP_MERGE_THRESH": 0.15,  # Horizontal overlap ratio to force merge
-    "TRG_MAX_SKEW_DEG": 3.0,  # Max angular skew to allow row grouping
-    # Row grouping
-    "ROW_TOL_FACTOR": 0.50,
-    "ROW_TOL_FALLBACK_PX": 8,
-    # Vertical block proximity
-    "BLOCK_PROX_FACTOR": 1.80,
-    # Layout Role Classifier (LRC)
-    "LRC_TOP_FRAC": 0.35,  # Top 35% of card = high prominence zone
-    "LRC_BOTTOM_FRAC": 0.60,  # Bottom 40% = address zone bias
-    "LRC_TALL_SCALE_RATIO": 1.40,  # Token height / median height > 1.4 → prominent
-    "LRC_NAME_MAX_TOKENS": 5,  # Max word count for a name candidate
-    "LRC_COMPANY_MAX_TOKENS": 8,
-    "LRC_TITLE_MAX_TOKENS": 8,
-    # Anchor proximity
-    "ANCHOR_PROX_LINES": 3,  # Lines above/below an anchor to attribute role
-    # Phone
-    "PHONE_MIN_DIGITS": 7,
-    "PHONE_MAX_DIGITS": 15,
-    "MAX_PHONES": 5,
-    # Fuzzy dedup
-    "FUZZY_SIM_THRESH": 80,
-    # Output
-    "EXCEL_DB_FILE": "master_contacts.xlsx",
-    "DEBUG": False,
-    # Script detection
-    "SECONDARY_SCRIPT_THRESH": 0.15,
-    # IOU dedup
-    "IOU_DEDUP_CELL_FACTOR": 0.40,
-    "IOU_DEDUP_CELL_MIN_PX": 12,
-    # Multi-pass OCR
-    "OCR_BRIGHTNESS_ALPHA": 1.35,
-    "OCR_BRIGHTNESS_BETA": 25,
-}
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
-EXCEL_COLS = [
-    "Timestamp",
-    "Name",
-    "Job Title",
-    "Company",
-    "Email",
-    "Phone_1",
-    "Phone_2",
-    "Phone_3",
-    "Website",
-    "Address",
-    "LinkedIn",
-    "Twitter",
-    "Instagram",
-    "GitHub",
-    "Quality",
-    "Confidence",
-    "Source",
-]
-_QUALITY_COLOUR = {"🟢 GREEN": "C6EFCE", "🟡 YELLOW": "FFEB9C", "🔴 RED": "FFC7CE"}
-_THIN_SIDE = Side(style="thin", color="BDD7EE")
-_THIN_BORDER = Border(
-    left=_THIN_SIDE, right=_THIN_SIDE, top=_THIN_SIDE, bottom=_THIN_SIDE
-)
-
-# ── STRUCTURAL PATTERN MATCHERS (no keyword content, pure format signatures) ──
-# These match structural patterns (symbols, digit runs, format shapes) NOT content words.
-_EMAIL_RE = re.compile(
-    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,253}\.[A-Za-z]{2,12}", re.I
-)
-_WEB_RE = re.compile(
-    r"(?:https?://|www\.)[A-Za-z0-9.\-/_%?=&#@]+|[A-Za-z0-9][\w\-]*\.[A-Za-z]{2,12}(?:/[^\s]*)?",
-    re.I,
-)
-_PHONE_DIGITS_RE = re.compile(r"[\+\(]?\d[\d\s\-\.\(\)]{5,16}\d")
-# Social: detected by structural prefix symbol patterns, NOT by platform name lists
-_SOCIAL_PREFIX_RE = re.compile(
-    r"(?:^|[\s,|•·])(@[\w.]{2,32}|/in/[\w\-]{3,100}|linkedin\.com/in/[\w\-]+|github\.com/[\w\-]+|twitter\.com/[\w]+|x\.com/[\w]+|instagram\.com/[\w.]+)",
-    re.I,
-)
-_AT_HANDLE_RE = re.compile(r"(?<![A-Za-z0-9])@([\w.]{2,32})")
-_POSTAL_SHAPE_RE = re.compile(
-    r"\b\d{4,7}\b"  # Generic 4-7 digit postal
-    r"|\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b"  # UK format
-    r"|\b\d{3}-\d{4}\b"  # Japanese format
-    r"|\b[A-Z]\d[A-Z]\s*\d[A-Z]\d\b",  # Canadian format
-    re.I,
-)
-# Structural: separators commonly found in address-type blocks
-_ADDR_SEPARATOR_RE = re.compile(r"[,/\|\\]{1}")
-
+# Delegated to core.config and core.models for modular architecture.
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CORE DATA STRUCTURES
+#  OCR + IMAGE PREPROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
-@dataclass
-class OCRToken:
-    """Raw OCR output token with full spatial metadata."""
-
-    text: str
-    confidence: float
-    bbox: np.ndarray  # shape (4, 2) — four corner points
-    center_x: float
-    center_y: float
-    width: float
-    height: float
-
-    @property
-    def x_min(self) -> float:
-        return float(np.min(self.bbox[:, 0]))
-
-    @property
-    def x_max(self) -> float:
-        return float(np.max(self.bbox[:, 0]))
-
-    @property
-    def y_min(self) -> float:
-        return float(np.min(self.bbox[:, 1]))
-
-    @property
-    def y_max(self) -> float:
-        return float(np.max(self.bbox[:, 1]))
-
-    @property
-    def char_width_est(self) -> float:
-        """Estimated per-character width using only alphabetic characters."""
-        alpha = sum(c.isalpha() for c in self.text)
-        return self.width / alpha if alpha > 0 else self.width / max(len(self.text), 1)
-
-
-@dataclass
-class TextRow:
-    """Reconstructed text row after TRG-based token stitching."""
-
-    tokens: List[OCRToken]
-    text: str
-    y_center: float
-    x_min: float
-    x_max: float
-    median_height: float
-    avg_confidence: float
-    # Layout metadata assigned by LRC
-    layout_role: str = "unknown"  # name|title|company|address|contact|social|unknown
-    role_score: float = 0.0
-    tps: float = 1.0  # Typographic Prominence Score (height ratio vs median)
-    position_frac: float = 0.5  # Normalized vertical position [0=top, 1=bottom]
-
-    @property
-    def word_count(self) -> int:
-        return len(self.text.split())
-
-    @property
-    def has_digit(self) -> bool:
-        return any(c.isdigit() for c in self.text)
-
-    @property
-    def digit_density(self) -> float:
-        return sum(c.isdigit() for c in self.text) / max(len(self.text), 1)
-
-    @property
-    def punct_density(self) -> float:
-        return sum(c in ",./-#@:;" for c in self.text) / max(len(self.text), 1)
-
-    @property
-    def alpha_density(self) -> float:
-        return sum(c.isalpha() for c in self.text) / max(len(self.text), 1)
-
-    @property
-    def is_all_caps(self) -> bool:
-        alpha = [c for c in self.text if c.isalpha()]
-        return len(alpha) > 0 and all(c.isupper() for c in alpha)
-
-    @property
-    def is_title_case(self) -> bool:
-        words = self.text.split()
-        return (
-            len(words) >= 1
-            and sum(w[0].isupper() for w in words if w) / len(words) >= 0.6
-        )
-
-    @property
-    def has_email_pattern(self) -> bool:
-        return bool(_EMAIL_RE.search(self.text))
-
-    @property
-    def has_phone_pattern(self) -> bool:
-        m = _PHONE_DIGITS_RE.search(self.text)
-        if not m:
-            return False
-        return (
-            CFG["PHONE_MIN_DIGITS"]
-            <= len(re.sub(r"\D", "", m.group(0)))
-            <= CFG["PHONE_MAX_DIGITS"]
-        )
-
-    @property
-    def has_web_pattern(self) -> bool:
-        return bool(_WEB_RE.search(self.text))
-
-    @property
-    def has_postal_pattern(self) -> bool:
-        return bool(_POSTAL_SHAPE_RE.search(self.text))
-
-    @property
-    def has_social_pattern(self) -> bool:
-        return bool(
-            _SOCIAL_PREFIX_RE.search(self.text) or _AT_HANDLE_RE.search(self.text)
-        )
-
-    @property
-    def separator_count(self) -> int:
-        return len(_ADDR_SEPARATOR_RE.findall(self.text))
-
-
-@dataclass
-class ContactCard:
-    name: str = "—"
-    job_title: str = "—"
-    company: str = "—"
-    email: str = "—"
-    phone_1: str = "—"
-    phone_2: str = "—"
-    phone_3: str = "—"
-    website: str = "—"
-    address: str = "—"
-    linkedin: str = "—"
-    twitter: str = "—"
-    instagram: str = "—"
-    github: str = "—"
-    quality_score: str = "🔴 RED"
-    raw_text: str = ""
-    confidence_avg: float = 0.0
-    source_file: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    def to_vcard(self) -> str:
-        lines = ["BEGIN:VCARD", "VERSION:3.0"]
-        if self.name != "—":
-            lines.append(f"FN:{self.name}")
-            p = self.name.split(maxsplit=1)
-            lines.append(
-                f"N:{p[-1]};{p[0]};;;" if len(p) == 2 else f"N:{self.name};;;;"
-            )
-        if self.company != "—":
-            lines.append(f"ORG:{self.company}")
-        if self.job_title != "—":
-            lines.append(f"TITLE:{self.job_title}")
-        if self.email != "—":
-            lines.append(f"EMAIL;TYPE=INTERNET:{self.email}")
-        if self.phone_1 != "—":
-            lines.append(f"TEL;TYPE=VOICE,PREF:{self.phone_1}")
-        if self.phone_2 != "—":
-            lines.append(f"TEL;TYPE=VOICE:{self.phone_2}")
-        if self.website != "—":
-            lines.append(f"URL:{self.website}")
-        if self.address != "—":
-            lines.append(f"ADR;TYPE=WORK:;;{self.address.replace(', ', '; ')};;;;")
-        lines.append("END:VCARD")
-        return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PADDLE OCR SINGLETON
-# ══════════════════════════════════════════════════════════════════════════════
-_PADDLE_CACHE: Dict[str, Any] = {}
-
-
-def _get_paddle(lang: str = "en"):
-    if lang not in _PADDLE_CACHE:
-        from paddleocr import PaddleOCR
-
-        _PADDLE_CACHE[lang] = PaddleOCR(
-            lang=lang,
-        )
-
-    return _PADDLE_CACHE[lang]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  IMAGE PREPROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
-def deskew(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-    lines = cv2.HoughLinesP(
-        cv2.Canny(gray, 50, 150),
-        1,
-        np.pi / 180,
-        threshold=80,
-        minLineLength=60,
-        maxLineGap=20,
-    )
-    if lines is None:
-        return img
-    angles = []
-    for l in lines:
-        a = math.degrees(math.atan2(l[0][3] - l[0][1], l[0][2] - l[0][0]))
-        if abs(a) < 45:
-            angles.append(a)
-    if not angles:
-        return img
-    angle = float(np.median(angles))
-    if abs(angle) < 0.5:
-        return img
-    h, w = img.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
-    nw = int(h * sin_a + w * cos_a)
-    nh = int(h * cos_a + w * sin_a)
-    M[0, 2] += (nw - w) / 2
-    M[1, 2] += (nh - h) / 2
-    return cv2.warpAffine(
-        img, M, (nw, nh), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-    )
-
-
-def preprocess(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    roi = gray[
-        int(img.shape[0] * 0.3) : int(img.shape[0] * 0.7),
-        int(img.shape[1] * 0.3) : int(img.shape[1] * 0.7),
-    ]
-    if roi.size > 0 and float(np.mean(roi)) < 120:
-        gray = cv2.bitwise_not(gray)
-    gray = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
-    sharpened = cv2.addWeighted(gray, 1.55, cv2.GaussianBlur(gray, (0, 0), 3), -0.55, 0)
-    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
-
-
-def segment_cards(img: np.ndarray) -> List[np.ndarray]:
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 30, 120)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    dilated = cv2.dilate(edges, kernel, iterations=3)
-    cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    pad = CFG["SEG_PAD_PX"]
-    rois = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if not (
-            h * w * CFG["SEG_MIN_AREA_FRAC"] <= area <= h * w * CFG["SEG_MAX_AREA_FRAC"]
-        ):
-            continue
-        x, y, cw, ch = cv2.boundingRect(c)
-        aspect = cw / max(ch, 1)
-        if CFG["SEG_CARD_ASPECT_MIN"] <= aspect <= CFG["SEG_CARD_ASPECT_MAX"]:
-            rois.append((x, y, cw, ch))
-    if not rois:
-        return [img]
-    rois.sort(key=lambda r: (r[1] // 100, r[0]))
-    return [
-        img[
-            max(0, y - pad) : min(h, y + ch + pad),
-            max(0, x - pad) : min(w, x + cw + pad),
-        ]
-        for x, y, cw, ch in rois
-    ]
+# Delegated to modular packages:
+#   imaging.preprocess, imaging.deskew, imaging.segment_cards,
+#   ocr.ocr_card, ocr.detect_scripts
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -537,165 +194,6 @@ class TokenReconstructionGraph:
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROW GROUPING & LINE ASSEMBLY
 # ══════════════════════════════════════════════════════════════════════════════
-def _parse_paddle_result(results) -> List[Tuple[str, float, List]]:
-    parsed = []
-
-    if not results:
-        return parsed
-
-    try:
-        result = results[0]
-
-        texts = result.get("rec_texts", [])
-        scores = result.get("rec_scores", [])
-        polys = result.get("rec_polys", [])
-
-        for text, conf, poly in zip(texts, scores, polys):
-
-            text = str(text).strip()
-            conf = float(conf)
-
-            if not text:
-                continue
-
-            if conf < CFG["OCR_CONF_THRESH"]:
-                continue
-
-            pts = [[float(x), float(y)] for x, y in poly]
-
-            parsed.append((text, conf, pts))
-
-    except Exception as e:
-        print("PARSE ERROR:", e)
-
-    print("\nPARSED TOKEN COUNT:", len(parsed))
-
-    for p in parsed[:10]:
-        print("TOKEN:", p[0], "CONF:", round(p[1], 3))
-
-    return parsed
-
-
-def _bbox_key(pts: List, cell_px: float) -> Tuple[int, int]:
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
-
-    print(f"BBOX KEY DEBUG | cx={cx:.1f} cy={cy:.1f} " f"cell_px={cell_px:.1f}")
-
-    return (
-        int(cx / cell_px),
-        int(cy / cell_px),
-    )
-
-
-def _iou_dedup(pool: dict) -> dict:
-    """Deduplicate overlapping OCR boxes — pure geometric IOU, no content."""
-    return pool  # Pool keyed by spatial cell already deduplicates spatially
-
-
-def _run_ocr_pass(img_bgr: np.ndarray, lang: str, cell_px: float, pool: dict):
-    if img_bgr.ndim == 2:
-        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
-
-    try:
-        ocr = _get_paddle(lang)
-
-        result = ocr.predict(img_bgr)
-
-        print("\n" + "=" * 80)
-        print("RAW PADDLE RESULT TYPE:")
-        print(type(result))
-        print("=" * 80)
-
-        # print("RAW PADDLE RESULT:")
-        # print(result)
-
-        parsed = _parse_paddle_result(result)
-
-        print("\n" + "=" * 80)
-        print("PARSED TOKEN COUNT:", len(parsed))
-        print("=" * 80)
-
-        if parsed:
-            print("FIRST 10 PARSED TOKENS:")
-            for item in parsed[:10]:
-                print(item)
-        else:
-            print("NO PARSED TOKENS RETURNED")
-
-        for text, conf, pts in parsed:
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-
-            tok = {
-                "text": text,
-                "conf": conf,
-                "bbox": pts,
-                "cx": sum(xs) / len(xs),
-                "cy": sum(ys) / len(ys),
-                "th": max(ys) - min(ys),
-                "tw": max(xs) - min(xs),
-            }
-
-            pool[len(pool)] = tok
-
-        print("\nPOOL SIZE AFTER OCR:", len(pool))
-
-    except Exception as e:
-        print("\nOCR EXCEPTION:")
-        import traceback
-
-        traceback.print_exc()
-
-        log.warning("OCR pass failure: %s", e)
-
-
-def detect_scripts(text: str) -> Tuple[str, Optional[str]]:
-    counts: Dict[str, int] = {"latin": 0, "cjk": 0, "arabic": 0, "devanagari": 0}
-    for ch in text:
-        if not ch.strip():
-            continue
-        cp = ord(ch)
-        if 0x4E00 <= cp <= 0x9FFF:
-            counts["cjk"] += 1
-        elif 0x0600 <= cp <= 0x06FF:
-            counts["arabic"] += 1
-        elif 0x0900 <= cp <= 0x097F:
-            counts["devanagari"] += 1
-        elif ch.isalpha():
-            counts["latin"] += 1
-    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    total = max(sum(counts.values()), 1)
-    secondary = next(
-        (sc for sc, cnt in ranked[1:] if cnt / total >= CFG["SECONDARY_SCRIPT_THRESH"]),
-        None,
-    )
-    return ranked[0][0], secondary
-
-
-def ocr_card(
-    proc: np.ndarray, lang_override: Optional[str] = None
-) -> Tuple[list, str, Optional[str]]:
-    h = proc.shape[0]
-    cell_px = max(h * CFG["IOU_DEDUP_CELL_FACTOR"], CFG["IOU_DEDUP_CELL_MIN_PX"])
-    pool: dict = {}
-    base = lang_override or "en"
-    _run_ocr_pass(proc, base, cell_px, pool)
-    _run_ocr_pass(
-        cv2.convertScaleAbs(
-            proc, alpha=CFG["OCR_BRIGHTNESS_ALPHA"], beta=CFG["OCR_BRIGHTNESS_BETA"]
-        ),
-        base,
-        cell_px,
-        pool,
-    )
-    pool = _iou_dedup(pool)
-    tokens = list(pool.values())
-    primary, secondary = detect_scripts(" ".join(t["text"] for t in tokens))
-    return tokens, primary, secondary
 
 
 def group_into_rows(raw_tokens: List[dict]) -> List[TextRow]:
@@ -738,6 +236,22 @@ def group_into_rows(raw_tokens: List[dict]) -> List[TextRow]:
         ]
         trg = TokenReconstructionGraph(ocr_tokens)
         text = trg.reconstruct()
+
+        print("\n" + "=" * 80)
+        print("ROW CREATED")
+        print("=" * 80)
+
+        print("TOKENS IN ROW:")
+        for tok in ocr_tokens:
+            print(
+                f"    {tok.text} | "
+                f"conf={tok.confidence:.3f} | "
+                f"x=({tok.x_min:.1f},{tok.x_max:.1f})"
+            )
+
+        print("\nRECONSTRUCTED TEXT:")
+        print(text)
+        print("=" * 80)
         y_vals = [t.center_y for t in ocr_tokens]
         x_mins = [t.x_min for t in ocr_tokens]
         x_maxs = [t.x_max for t in ocr_tokens]
@@ -1457,8 +971,33 @@ def process_card_image(img: np.ndarray, label: str) -> ContactCard:
     proc = preprocess(img)
     tokens, primary, secondary = ocr_card(proc)
     rows = group_into_rows(tokens)
+
+    print("\n" + "#" * 80)
+    print("AFTER GROUP INTO ROWS")
+    print("#" * 80)
+
+    for i, row in enumerate(rows):
+        print(f"{i}: {row.text}")
+
     rows = remove_fuzzy_duplicates(rows)
+
+    print("\n" + "#" * 80)
+    print("AFTER REMOVE FUZZY DUPLICATES")
+    print("#" * 80)
+
+    for i, row in enumerate(rows):
+        print(f"{i}: {row.text}")
+
     rows = fuse_proximate_blocks(rows)
+
+    print("\n" + "#" * 80)
+    print("AFTER BLOCK FUSION")
+    print("#" * 80)
+
+    for i, row in enumerate(rows):
+        print(f"{i}: {row.text}")
+
+    return extract_contact_card(rows, label)
     return extract_contact_card(rows, label)
 
 
