@@ -276,6 +276,40 @@ class V21SpatialRegion:
 
 
 @dataclass(frozen=True)
+class V21LinkedPairEvidence:
+    """Immutable diagnostic snapshot of the geometry evaluated during region linkage.
+
+    This records the exact pairwise measurements already used to decide whether
+    two canonical entities are linked, without imposing any panel semantics or
+    changing the underlying region logic.
+    """
+
+    first_entity_id: str
+    second_entity_id: str
+    dx: float
+    dy: float
+    normalized_dx: float
+    normalized_dy: float
+    close_x: bool
+    close_y: bool
+    same_row_band: bool
+    same_column_band: bool
+    scale: float
+    first_bbox: BBox
+    second_bbox: BBox
+    vertical_overlap: float
+    horizontal_overlap: float
+    linked: bool
+
+
+@dataclass(frozen=True)
+class V21SpatialEvidence:
+    """Immutable, diagnostic-only preservation of the existing region-linkage geometry."""
+
+    linked_pair_evidence: Tuple[V21LinkedPairEvidence, ...]
+
+
+@dataclass(frozen=True)
 class V21SpatialRepresentation:
     regions: Tuple[V21SpatialRegion, ...]
     geometries: Tuple[V21PanelRelativeGeometry, ...]
@@ -318,6 +352,47 @@ def _union(entities: tuple[V21CanonicalEntity, ...]) -> BBox:
     )
 
 
+def _linked_pair_evidence(
+    first: V21CanonicalEntity, second: V21CanonicalEntity, scale: float
+) -> V21LinkedPairEvidence:
+    first_box = first.canonical_bbox
+    second_box = second.canonical_bbox
+    first_center = _center(first_box)
+    second_center = _center(second_box)
+    dx = abs(first_center[0] - second_center[0])
+    dy = abs(first_center[1] - second_center[1])
+    vertical_overlap = min(first_box[3], second_box[3]) - max(
+        first_box[1], second_box[1]
+    )
+    horizontal_overlap = min(first_box[2], second_box[2]) - max(
+        first_box[0], second_box[0]
+    )
+    close_x = dx <= max(_width(first_box), _width(second_box), scale) * 6.0
+    close_y = dy <= max(_height(first_box), _height(second_box), scale) * 6.0
+    same_row_band = vertical_overlap > 0.0 or dy <= scale * 1.5
+    same_column_band = horizontal_overlap > 0.0 or dx <= scale * 1.5
+    linked = (close_x and same_row_band) or (close_y and same_column_band)
+    first_id, second_id = sorted((first.canonical_id, second.canonical_id))
+    return V21LinkedPairEvidence(
+        first_entity_id=first_id,
+        second_entity_id=second_id,
+        dx=dx,
+        dy=dy,
+        normalized_dx=dx / scale if scale > 0.0 else 0.0,
+        normalized_dy=dy / scale if scale > 0.0 else 0.0,
+        close_x=close_x,
+        close_y=close_y,
+        same_row_band=same_row_band,
+        same_column_band=same_column_band,
+        scale=scale,
+        first_bbox=first_box,
+        second_bbox=second_box,
+        vertical_overlap=vertical_overlap,
+        horizontal_overlap=horizontal_overlap,
+        linked=linked,
+    )
+
+
 def _region_linked(
     first: V21CanonicalEntity, second: V21CanonicalEntity, scale: float
 ) -> bool:
@@ -340,11 +415,11 @@ def _region_linked(
     return (close_x and same_row_band) or (close_y and same_column_band)
 
 
-def _region_components(
+def _region_linkage_graph(
     entities: tuple[V21CanonicalEntity, ...],
-) -> list[tuple[V21CanonicalEntity, ...]]:
+) -> tuple[dict[str, set[str]], tuple[V21LinkedPairEvidence, ...]]:
     if not entities:
-        return []
+        return {}, ()
     scale = median(
         [
             max(_width(item.canonical_bbox), _height(item.canonical_bbox))
@@ -352,12 +427,28 @@ def _region_components(
         ]
     )
     adjacency = {item.canonical_id: set() for item in entities}
+    evidence: list[V21LinkedPairEvidence] = []
     for index, first in enumerate(entities):
         for second in entities[index + 1 :]:
-            if _region_linked(first, second, scale):
+            pair_evidence = _linked_pair_evidence(first, second, scale)
+            evidence.append(pair_evidence)
+            if pair_evidence.linked:
                 adjacency[first.canonical_id].add(second.canonical_id)
                 adjacency[second.canonical_id].add(first.canonical_id)
+    return adjacency, tuple(
+        sorted(
+            evidence,
+            key=lambda item: (item.first_entity_id, item.second_entity_id),
+        )
+    )
 
+
+def _region_components(
+    entities: tuple[V21CanonicalEntity, ...],
+) -> list[tuple[V21CanonicalEntity, ...]]:
+    if not entities:
+        return []
+    adjacency, _ = _region_linkage_graph(entities)
     by_id = {item.canonical_id: item for item in entities}
     components = []
     visited: set[str] = set()
@@ -377,6 +468,29 @@ def _region_components(
             tuple(by_id[entity_id] for entity_id in sorted(component_ids))
         )
     return components
+
+
+def build_spatial_evidence(
+    reconciled_result: V21ReconciliationResult,
+) -> V21SpatialEvidence:
+    """Return ordered, deterministic evidence for the exact existing region-linkage graph.
+
+    This executes a single ``_region_linkage_graph`` call over the full entity
+    population -- the same call whose adjacency determines region membership in
+    ``_region_components``/``build_spatial_representation``. Filtering that one
+    result for ``linked`` pairs is sufficient: only pairs already scored
+    ``linked=True`` can ever share a connected component, so no per-component
+    recomputation (and therefore no per-component rescaling) is needed.
+    """
+    _, evidence = _region_linkage_graph(reconciled_result.entities)
+    return V21SpatialEvidence(
+        linked_pair_evidence=tuple(
+            sorted(
+                (item for item in evidence if item.linked),
+                key=lambda item: (item.first_entity_id, item.second_entity_id),
+            )
+        )
+    )
 
 
 def _make_rows(
