@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from math import hypot
 from pathlib import Path
 from statistics import median
@@ -562,23 +563,23 @@ def _make_columns(
         entities, key=lambda item: (_center(item.canonical_bbox)[0], item.canonical_id)
     )
     columns: list[list[V21CanonicalEntity]] = []
-    column_centers: list[float] = []
+    column_anchors: list[float] = []
     for entity in ordered:
         center_x = _center(entity.canonical_bbox)[0]
         matching = [
             index
-            for index, column_x in enumerate(column_centers)
+            for index, column_x in enumerate(column_anchors)
             if abs(center_x - column_x) <= scale * 1.5
         ]
         if matching:
-            column_index = matching[0]
+            column_index = min(
+                matching,
+                key=lambda index: (abs(center_x - column_anchors[index]), index),
+            )
             columns[column_index].append(entity)
-            column_centers[column_index] = sum(
-                _center(item.canonical_bbox)[0] for item in columns[column_index]
-            ) / len(columns[column_index])
         else:
             columns.append([entity])
-            column_centers.append(center_x)
+            column_anchors.append(center_x)
     result = []
     for index, column in enumerate(columns, 1):
         column.sort(
@@ -1021,6 +1022,384 @@ def determine_panel_primacy(
     return V21PanelPrimacyResult(
         ranked_regions=ranked,
         primary_region_id=ranked[0].region_id if ranked else "",
+    )
+
+
+# Phase 5 bounds are deliberately separate: limiting the final result does not
+# permit unbounded edge or cut-set enumeration.
+V21_MAX_OUTLIER_EDGES = 12
+V21_MAX_CUT_SETS = 12
+V21_MAX_HYPOTHESES_PER_REGION = 12
+V21_MAX_TOTAL_HYPOTHESES = 64
+
+
+@dataclass(frozen=True)
+class V21HypothesisGroup:
+    group_id: str
+    entity_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class V21SubregionHypothesis:
+    hypothesis_id: str
+    region_id: str
+    groups: Tuple[V21HypothesisGroup, ...]
+    score: float
+    rank: int
+    cut_edge_ids: Tuple[Tuple[str, str], ...] = ()
+    score_components: Tuple[Tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class V21SubregionRegionDiagnostics:
+    region_id: str
+    candidate_outlier_edges_considered: int
+    candidate_cut_sets_evaluated: int
+    hypotheses_returned: int
+
+
+@dataclass(frozen=True)
+class V21SubregionHypothesisResult:
+    hypotheses: Tuple[V21SubregionHypothesis, ...]
+    diagnostics: Tuple[V21SubregionRegionDiagnostics, ...] = ()
+
+
+def _phase5_components(
+    entity_ids: Iterable[str],
+    edges: Iterable[Tuple[str, str]],
+    removed: frozenset[Tuple[str, str]],
+) -> tuple[tuple[str, ...], ...]:
+    adjacency = {entity_id: set() for entity_id in entity_ids}
+    for first, second in edges:
+        edge = tuple(sorted((first, second)))
+        if edge in removed:
+            continue
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+    components = []
+    visited = set()
+    for entity_id in sorted(adjacency):
+        if entity_id in visited:
+            continue
+        pending = [entity_id]
+        component = []
+        while pending:
+            current = pending.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            pending.extend(sorted(adjacency[current] - visited))
+        components.append(tuple(sorted(component)))
+    return tuple(sorted(components))
+
+
+def _phase5_intervening_count(
+    edge: V21LinkedPairEvidence,
+    edges: tuple[V21LinkedPairEvidence, ...],
+) -> int:
+    scale = max(edge.scale, 1.0)
+    first_center = _center(edge.first_bbox)
+    second_center = _center(edge.second_bbox)
+    dx = second_center[0] - first_center[0]
+    dy = second_center[1] - first_center[1]
+    length = hypot(dx, dy)
+    if length <= 0.0:
+        return 0
+    intervening = 0
+    for other in edges:
+        if other is edge:
+            continue
+        for candidate_center in (_center(other.first_bbox), _center(other.second_bbox)):
+            projection = (
+                (candidate_center[0] - first_center[0]) * dx
+                + (candidate_center[1] - first_center[1]) * dy
+            ) / length
+            perpendicular = (
+                abs(
+                    (candidate_center[0] - first_center[0]) * dy
+                    - (candidate_center[1] - first_center[1]) * dx
+                )
+                / length
+            )
+            if 0.0 < projection < length and perpendicular <= scale:
+                intervening += 1
+                break
+    return intervening
+
+
+def _phase5_edge_strength(
+    edge: V21LinkedPairEvidence,
+    edges: tuple[V21LinkedPairEvidence, ...],
+) -> float:
+    scale = max(edge.scale, 1.0)
+    edge_gap = (
+        max(0.0, -edge.horizontal_overlap) + max(0.0, -edge.vertical_overlap)
+    ) / scale
+    competing = []
+    for other in edges:
+        if other is edge:
+            continue
+        if edge.first_entity_id in (other.first_entity_id, other.second_entity_id) or (
+            edge.second_entity_id in (other.first_entity_id, other.second_entity_id)
+        ):
+            competing.append(
+                (
+                    max(0.0, -other.horizontal_overlap)
+                    + max(0.0, -other.vertical_overlap)
+                )
+                / max(other.scale, 1.0)
+            )
+    if not competing:
+        return 0.0
+    local_gap = min(competing)
+    anomaly = max(0.0, edge_gap - local_gap)
+    return anomaly / (1.0 + _phase5_intervening_count(edge, edges))
+
+
+def _phase5_cut_sets(
+    edges: tuple[V21LinkedPairEvidence, ...],
+) -> tuple[tuple[Tuple[str, str], ...], ...]:
+    if not edges:
+        return ()
+    seeds = [
+        edge
+        for edge in edges
+        if _phase5_edge_strength(edge, edges) > 0.0
+        and _phase5_intervening_count(edge, edges) == 0
+    ]
+    if not seeds:
+        return ()
+    seed_ids = {
+        entity_id
+        for edge in seeds
+        for entity_id in (edge.first_entity_id, edge.second_entity_id)
+    }
+    related = [
+        edge
+        for edge in edges
+        if edge not in seeds
+        and (edge.first_entity_id in seed_ids or edge.second_entity_id in seed_ids)
+    ]
+    ranked = sorted(
+        (*seeds, *related),
+        key=lambda edge: (
+            -_phase5_edge_strength(edge, edges),
+            _phase5_intervening_count(edge, edges),
+            edge.first_entity_id,
+            edge.second_entity_id,
+        ),
+    )[:V21_MAX_OUTLIER_EDGES]
+    edge_ids = tuple((edge.first_entity_id, edge.second_entity_id) for edge in ranked)
+    cut_sets: list[tuple[Tuple[str, str], ...]] = [
+        tuple(sorted(edge_ids[:size])) for size in range(1, min(3, len(edge_ids)) + 1)
+    ]
+    for size in range(1, min(3, len(edge_ids)) + 1):
+        for candidate in combinations(edge_ids, size):
+            normalized = tuple(sorted(candidate))
+            if normalized in cut_sets:
+                continue
+            cut_sets.append(normalized)
+            if len(cut_sets) >= V21_MAX_CUT_SETS:
+                return tuple(cut_sets)
+    return tuple(cut_sets)
+
+
+def _phase5_score(
+    groups: tuple[tuple[str, ...], ...],
+    entity_by_id: dict[str, V21CanonicalEntity],
+    cut_edges: tuple[Tuple[str, str], ...],
+    all_edges: tuple[V21LinkedPairEvidence, ...],
+    candidates: Tuple[V21ContactCandidate, ...],
+) -> tuple[float, tuple[tuple[str, float], ...]]:
+    boxes = [
+        entity_by_id[entity_id].canonical_bbox
+        for group in groups
+        for entity_id in group
+    ]
+    widths = [_width(box) for box in boxes]
+    heights = [_height(box) for box in boxes]
+    scale = max(median(widths + heights), 1.0)
+    compactness_values = []
+    for group in groups:
+        group_boxes = [entity_by_id[item].canonical_bbox for item in group]
+        envelope = (
+            min(box[0] for box in group_boxes),
+            min(box[1] for box in group_boxes),
+            max(box[2] for box in group_boxes),
+            max(box[3] for box in group_boxes),
+        )
+        envelope_area = max(_width(envelope) * _height(envelope), scale * scale)
+        member_area = sum(_width(box) * _height(box) for box in group_boxes)
+        compactness_values.append(min(1.0, member_area / envelope_area))
+    coherence = sum(compactness_values) / max(len(compactness_values), 1)
+    separation_edges = {tuple(sorted(edge)) for edge in cut_edges}
+    separation = sum(
+        (edge.normalized_dx + edge.normalized_dy) / 2.0
+        for edge in all_edges
+        if (edge.first_entity_id, edge.second_entity_id) in separation_edges
+    ) / max(len(cut_edges), 1)
+    separation = min(1.0, separation / 3.0)
+    balance = min(len(group) for group in groups) / max(len(group) for group in groups)
+    anchor_ids = {
+        entity_id
+        for candidate in candidates
+        for entity_id in candidate.source_canonical_entity_ids
+    }
+    anchor_concentration = (
+        1.0 if any(anchor_ids.intersection(group) for group in groups) else 0.0
+    )
+    score = (
+        0.35 * coherence
+        + 0.30 * separation
+        + 0.20 * balance
+        + 0.15 * anchor_concentration
+    )
+    components = (
+        ("coherence", round(coherence, 6)),
+        ("separation", round(separation, 6)),
+        ("balance", round(balance, 6)),
+        ("anchor_concentration", round(anchor_concentration, 6)),
+    )
+    return round(score, 6), components
+
+
+def generate_subregion_hypotheses(
+    reconciliation: V21ReconciliationResult,
+    spatial: V21SpatialRepresentation,
+    evidence: V21SpatialEvidence,
+    candidates: Tuple[V21ContactCandidate, ...],
+) -> V21SubregionHypothesisResult:
+    """Generate bounded, crisp spatial alternatives inside existing regions.
+
+    H0 is always emitted. Split candidates remove deterministic subsets of at
+    most three strongest normalized outlier edges. A singleton is rejected
+    unless it has at least two independent linked neighbours in the induced
+    graph, preventing one weak peripheral edge from manufacturing a panel.
+    """
+    entities = {entity.canonical_id: entity for entity in reconciliation.entities}
+    evidence_by_region = {
+        region.region_id: tuple(
+            sorted(
+                (
+                    item
+                    for item in evidence.linked_pair_evidence
+                    if item.first_entity_id in region.entity_ids
+                    and item.second_entity_id in region.entity_ids
+                ),
+                key=lambda item: (item.first_entity_id, item.second_entity_id),
+            )
+        )
+        for region in spatial.regions
+    }
+    all_hypotheses = []
+    diagnostics = []
+    for region in spatial.regions:
+        region_ids = tuple(sorted(region.entity_ids))
+        region_edges = evidence_by_region[region.region_id]
+        edge_ids = tuple(
+            (item.first_entity_id, item.second_entity_id) for item in region_edges
+        )
+        h0_groups = (
+            V21HypothesisGroup(f"{region.region_id}-group-000001", region_ids),
+        )
+        h0_score, h0_components = _phase5_score(
+            (region_ids,), entities, (), region_edges, candidates
+        )
+        region_hypotheses = [
+            V21SubregionHypothesis(
+                hypothesis_id=f"{region.region_id}-hypothesis-000001",
+                region_id=region.region_id,
+                groups=h0_groups,
+                score=h0_score,
+                rank=0,
+                score_components=h0_components,
+            )
+        ]
+        cut_sets = _phase5_cut_sets(region_edges) if len(region_ids) > 2 else ()
+        accepted = []
+        neighbours = {entity_id: set() for entity_id in region_ids}
+        for first, second in edge_ids:
+            neighbours[first].add(second)
+            neighbours[second].add(first)
+        for cut_set in cut_sets:
+            groups = _phase5_components(region_ids, edge_ids, frozenset(cut_set))
+            if len(groups) <= 1:
+                continue
+            if any(
+                len(group) == 1 and len(neighbours[group[0]]) < 2 for group in groups
+            ):
+                continue
+            score, components = _phase5_score(
+                groups, entities, cut_set, region_edges, candidates
+            )
+            accepted.append(
+                V21SubregionHypothesis(
+                    hypothesis_id="",
+                    region_id=region.region_id,
+                    groups=tuple(
+                        V21HypothesisGroup(
+                            f"{region.region_id}-group-{index:06d}", group
+                        )
+                        for index, group in enumerate(groups, 1)
+                    ),
+                    score=score,
+                    rank=0,
+                    cut_edge_ids=cut_set,
+                    score_components=components,
+                )
+            )
+        accepted.sort(
+            key=lambda item: (
+                -item.score,
+                len(item.groups),
+                tuple(
+                    entity_id for group in item.groups for entity_id in group.entity_ids
+                ),
+                item.cut_edge_ids,
+            )
+        )
+        region_hypotheses.extend(accepted[: V21_MAX_HYPOTHESES_PER_REGION - 1])
+        ranked = []
+        for index, item in enumerate(
+            sorted(
+                region_hypotheses,
+                key=lambda candidate: (
+                    -candidate.score,
+                    len(candidate.groups),
+                    tuple(
+                        entity_id
+                        for group in candidate.groups
+                        for entity_id in group.entity_ids
+                    ),
+                    candidate.cut_edge_ids,
+                ),
+            ),
+            1,
+        ):
+            ranked.append(
+                V21SubregionHypothesis(
+                    **{
+                        **item.__dict__,
+                        "hypothesis_id": f"{region.region_id}-hypothesis-{index:06d}",
+                        "rank": index,
+                    }
+                )
+            )
+        all_hypotheses.extend(ranked)
+        diagnostics.append(
+            V21SubregionRegionDiagnostics(
+                region_id=region.region_id,
+                candidate_outlier_edges_considered=min(
+                    len(region_edges), V21_MAX_OUTLIER_EDGES
+                ),
+                candidate_cut_sets_evaluated=min(len(cut_sets), V21_MAX_CUT_SETS),
+                hypotheses_returned=len(ranked),
+            )
+        )
+    all_hypotheses = all_hypotheses[:V21_MAX_TOTAL_HYPOTHESES]
+    return V21SubregionHypothesisResult(
+        hypotheses=tuple(all_hypotheses), diagnostics=tuple(diagnostics)
     )
 
 

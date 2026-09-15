@@ -54,6 +54,86 @@ def test_two_columns_keep_rows_and_columns_as_ids():
     ]
 
 
+def test_columns_do_not_chain_through_a_running_centroid():
+    result = build_spatial_representation(
+        _result(
+            _entity(1, (0, 0, 2, 2)),
+            _entity(2, (2, 10, 4, 12)),
+            _entity(3, (4, 20, 6, 22)),
+        )
+    )
+    assert [column.entity_ids for column in result.regions[0].columns] == [
+        ("canonical-000001", "canonical-000002"),
+        ("canonical-000003",),
+    ]
+
+
+def test_columns_keep_two_horizontal_groups_with_width_variation():
+    result = build_spatial_representation(
+        _result(
+            _entity(1, (0, 0, 30, 10)),
+            _entity(2, (100, 2, 120, 12)),
+            _entity(3, (5, 30, 15, 40)),
+            _entity(4, (95, 32, 135, 42)),
+        )
+    )
+    assert [column.entity_ids for column in result.regions[0].columns] == [
+        ("canonical-000001", "canonical-000003"),
+        ("canonical-000002", "canonical-000004"),
+    ]
+
+
+def test_columns_are_scale_invariant_and_deterministic():
+    small = _result(
+        _entity(1, (0, 0, 30, 10)),
+        _entity(2, (100, 2, 120, 12)),
+        _entity(3, (5, 30, 15, 40)),
+        _entity(4, (95, 32, 135, 42)),
+    )
+    large = _result(
+        _entity(1, (0, 0, 60, 20)),
+        _entity(2, (200, 4, 240, 24)),
+        _entity(3, (10, 60, 30, 80)),
+        _entity(4, (190, 64, 270, 84)),
+    )
+    small_result = build_spatial_representation(small)
+    large_result = build_spatial_representation(large)
+    assert [column.entity_ids for column in small_result.regions[0].columns] == [
+        column.entity_ids for column in large_result.regions[0].columns
+    ]
+    assert small_result == build_spatial_representation(small)
+
+
+def test_gaurav_shaped_geometry_keeps_left_middle_and_right_columns():
+    result = build_spatial_representation(
+        _result(
+            _entity(1, (175, 0, 191, 10)),
+            _entity(2, (190, 20, 270, 40)),
+            _entity(3, (240, 40, 320, 60)),
+            _entity(4, (380, 60, 460, 80)),
+            _entity(5, (420, 80, 500, 100)),
+            _entity(6, (580, 100, 660, 120)),
+            _entity(7, (630, 120, 710, 140)),
+            _entity(8, (680, 140, 760, 160)),
+        )
+    )
+    assert len(result.regions[0].columns) == 3
+    assert [len(column.entity_ids) for column in result.regions[0].columns] == [
+        3,
+        2,
+        3,
+    ]
+
+
+def test_one_and_two_entities_keep_expected_column_behavior():
+    one = build_spatial_representation(_result(_entity(1, (0, 0, 10, 10))))
+    two = build_spatial_representation(
+        _result(_entity(1, (0, 0, 10, 10)), _entity(2, (20, 5, 30, 15)))
+    )
+    assert len(one.regions[0].columns) == 1
+    assert len(two.regions[0].columns) == 2
+
+
 def test_two_separated_regions_do_not_share_rows():
     result = build_spatial_representation(
         _result(
