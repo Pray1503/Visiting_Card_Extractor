@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V21 Phase 1: preserve raw two-pass PaddleOCR evidence."""
+"""V21 Phase 1–6 Pipeline Implementation."""
 
 import argparse
 import json
@@ -20,6 +20,10 @@ from imaging import deskew, preprocess
 from ocr.paddle import _get_paddle
 
 log = logging.getLogger("VC_OCR_v21")
+
+# ==============================================================================
+# PHASE 1 — OCR EVIDENCE COLLECTION & IMMUTABLE POOL
+# ==============================================================================
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,11 @@ class V21EvidencePool:
         ]
 
 
+# ==============================================================================
+# PHASE 2 — RECONCILIATION & CANONICAL ENTITIES
+# ==============================================================================
+
+
 BBox = Tuple[float, float, float, float]
 
 
@@ -118,12 +127,7 @@ def _intersection_area(first: BBox, second: BBox) -> float:
 
 
 def _spatially_compatible(first: V21OCREvidence, second: V21OCREvidence) -> bool:
-    """Return true only for strong cross-pass correspondence.
-
-    A match requires meaningful area overlap and centers close relative to the
-    smaller observation. This prevents identical text in separate regions from
-    merging while allowing one pass to split or combine the other pass's box.
-    """
+    """Return true only for strong cross-pass correspondence."""
     first_box = _bbox(first)
     second_box = _bbox(second)
     first_area = _area(first_box)
@@ -187,13 +191,7 @@ def _representative(
 
 
 def reconcile_evidence(pool: V21EvidencePool) -> V21ReconciliationResult:
-    """Build a deterministic canonical view without changing the evidence pool.
-
-    Only observations from different passes can create an edge. Connected
-    components therefore reconcile pass-specific echoes and split/combined
-    tokenizations, while same-pass observations remain separate by default.
-    Components and source IDs are ordered by geometry and stable token ID.
-    """
+    """Build a deterministic canonical view without changing the evidence pool."""
     observations = tuple(pool.observations)
     adjacency = {item.token_id: set() for item in observations}
     for index, first in enumerate(observations):
@@ -244,6 +242,11 @@ def reconcile_evidence(pool: V21EvidencePool) -> V21ReconciliationResult:
     return V21ReconciliationResult(entities=tuple(entities))
 
 
+# ==============================================================================
+# PHASE 3 — SPATIAL REPRESENTATION & PANEL-RELATIVE GEOMETRY
+# ==============================================================================
+
+
 @dataclass(frozen=True)
 class V21PanelRelativeGeometry:
     entity_id: str
@@ -278,12 +281,7 @@ class V21SpatialRegion:
 
 @dataclass(frozen=True)
 class V21LinkedPairEvidence:
-    """Immutable diagnostic snapshot of the geometry evaluated during region linkage.
-
-    This records the exact pairwise measurements already used to decide whether
-    two canonical entities are linked, without imposing any panel semantics or
-    changing the underlying region logic.
-    """
+    """Immutable diagnostic snapshot of the geometry evaluated during region linkage."""
 
     first_entity_id: str
     second_entity_id: str
@@ -474,15 +472,7 @@ def _region_components(
 def build_spatial_evidence(
     reconciled_result: V21ReconciliationResult,
 ) -> V21SpatialEvidence:
-    """Return ordered, deterministic evidence for the exact existing region-linkage graph.
-
-    This executes a single ``_region_linkage_graph`` call over the full entity
-    population -- the same call whose adjacency determines region membership in
-    ``_region_components``/``build_spatial_representation``. Filtering that one
-    result for ``linked`` pairs is sufficient: only pairs already scored
-    ``linked=True`` can ever share a connected component, so no per-component
-    recomputation (and therefore no per-component rescaling) is needed.
-    """
+    """Return ordered, deterministic evidence for the exact existing region-linkage graph."""
     _, evidence = _region_linkage_graph(reconciled_result.entities)
     return V21SpatialEvidence(
         linked_pair_evidence=tuple(
@@ -670,6 +660,11 @@ def build_spatial_representation(
     )
 
 
+# ==============================================================================
+# PHASE 4 — DETERMINISTIC CONTACT EXTRACTION & PANEL PRIMACY
+# ==============================================================================
+
+
 @dataclass(frozen=True)
 class V21ContactCandidate:
     candidate_id: str
@@ -755,18 +750,6 @@ def _entity_order(
         for entity_id in spatial.read_order
         if entity_id in by_id
     }
-
-
-def _same_row_sequences(
-    reconciliation: V21ReconciliationResult,
-    spatial: V21SpatialRepresentation,
-) -> Iterable[Tuple[V21CanonicalEntity, ...]]:
-    by_id = {entity.canonical_id: entity for entity in reconciliation.entities}
-    for region in spatial.regions:
-        for row in region.rows:
-            entities = tuple(by_id[entity_id] for entity_id in row.entity_ids)
-            for index in range(len(entities) - 1):
-                yield entities[index : index + 2]
 
 
 def _reconstructible_phone_pair(
@@ -1025,8 +1008,11 @@ def determine_panel_primacy(
     )
 
 
-# Phase 5 bounds are deliberately separate: limiting the final result does not
-# permit unbounded edge or cut-set enumeration.
+# ==============================================================================
+# PHASE 5 — SUBREGION HYPOTHESIS GENERATION
+# ==============================================================================
+
+
 V21_MAX_OUTLIER_EDGES = 12
 V21_MAX_CUT_SETS = 12
 V21_MAX_HYPOTHESES_PER_REGION = 12
@@ -1270,13 +1256,7 @@ def generate_subregion_hypotheses(
     evidence: V21SpatialEvidence,
     candidates: Tuple[V21ContactCandidate, ...],
 ) -> V21SubregionHypothesisResult:
-    """Generate bounded, crisp spatial alternatives inside existing regions.
-
-    H0 is always emitted. Split candidates remove deterministic subsets of at
-    most three strongest normalized outlier edges. A singleton is rejected
-    unless it has at least two independent linked neighbours in the induced
-    graph, preventing one weak peripheral edge from manufacturing a panel.
-    """
+    """Generate bounded, crisp spatial alternatives inside existing regions."""
     entities = {entity.canonical_id: entity for entity in reconciliation.entities}
     evidence_by_region = {
         region.region_id: tuple(
@@ -1403,6 +1383,917 @@ def generate_subregion_hypotheses(
     )
 
 
+# ==============================================================================
+# PHASE 6 — IDENTITY BINDINGS, COMPOSITION, SCORING & PURE BINDING
+# ==============================================================================
+
+
+_FIELD_PRIORITY: Tuple[str, ...] = ("NAME", "TITLE", "COMPANY")
+_NEUTRAL_FEATURE_VALUE = 0.5
+
+_NAME_WEIGHTS: Tuple[Tuple[str, float], ...] = (
+    ("prominence", 0.25),
+    ("read_centrality", 0.25),
+    ("column_alignment", 0.25),
+    ("compactness", 0.25),
+)
+_TITLE_WEIGHTS: Tuple[Tuple[str, float], ...] = (
+    ("relative_height", 0.25),
+    ("row_centrality", 0.25),
+    ("horizontal_alignment", 0.25),
+    ("compactness", 0.25),
+)
+_COMPANY_WEIGHTS: Tuple[Tuple[str, float], ...] = (
+    ("span_width", 0.25),
+    ("group_density", 0.25),
+    ("region_prominence", 0.25),
+    ("contact_anchor", 0.25),
+)
+_FIELD_WEIGHTS: dict[str, Tuple[Tuple[str, float], ...]] = {
+    "NAME": _NAME_WEIGHTS,
+    "TITLE": _TITLE_WEIGHTS,
+    "COMPANY": _COMPANY_WEIGHTS,
+}
+
+
+@dataclass(frozen=True)
+class V21IdentityCandidate:
+    candidate_id: str
+    field_type: str
+    text: str
+    composition_type: str
+
+    hypothesis_id: str
+    group_id: str
+    region_id: str
+
+    source_entity_ids: Tuple[str, ...]
+
+    row_ids: Tuple[str, ...]
+    column_ids: Tuple[str, ...]
+
+    source_candidate_ids: Tuple[str, ...]
+    source_edge_ids: Tuple[str, ...]
+
+    raw_features: Tuple[Tuple[str, float], ...]
+    normalized_features: Tuple[Tuple[str, float], ...]
+    weights: Tuple[Tuple[str, float], ...]
+
+    score: float
+
+
+@dataclass(frozen=True)
+class V21IdentityBinding:
+    hypothesis_id: str
+
+    name_candidate_id: Optional[str]
+    title_candidate_id: Optional[str]
+    company_candidate_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class V21IdentityResult:
+    candidates: Tuple[V21IdentityCandidate, ...]
+    bindings: Tuple[V21IdentityBinding, ...]
+
+
+def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
+
+
+def _union_box_for_entity_ids(
+    entity_ids: Iterable[str], entity_by_id: dict[str, V21CanonicalEntity]
+) -> BBox:
+    boxes = [entity_by_id[entity_id].canonical_bbox for entity_id in entity_ids]
+    if not boxes:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def _entity_row_and_column_ids(
+    spatial: V21SpatialRepresentation,
+    entity_id: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    row_ids = tuple(
+        row_id for entity, row_id in spatial.entity_row_ids if entity == entity_id
+    )
+    column_ids = tuple(
+        column_id
+        for entity, column_id in spatial.entity_column_ids
+        if entity == entity_id
+    )
+    return row_ids, column_ids
+
+
+def _compute_local_edge_context(
+    target_edge: V21LinkedPairEvidence,
+    all_edges: Tuple[V21LinkedPairEvidence, ...],
+    hypothesis: V21SubregionHypothesis,
+    by_id: dict[str, V21CanonicalEntity],
+) -> Optional[Tuple[float, float]]:
+    """Return local gap statistics for a target edge.
+
+    The target edge and its reciprocal pair are excluded. Neighbor edges must:
+    - belong to the same Phase 5 hypothesis/group scope,
+    - have the same spatial direction, and
+    - be geometrically local to the target edge.
+
+    The measured quantity is the directional bounding-box gap, not center-to-center
+    distance, because composition validates the actual whitespace between entities.
+    """
+    valid_group_entity_ids = {
+        entity_id
+        for group in hypothesis.groups
+        for entity_id in group.entity_ids
+    }
+
+    target_horizontal = target_edge.same_row_band and not target_edge.same_column_band
+    target_vertical = target_edge.same_column_band and not target_edge.same_row_band
+    if not (target_horizontal or target_vertical):
+        return None
+
+    target_pair = frozenset(
+        (target_edge.first_entity_id, target_edge.second_entity_id)
+    )
+    scale = max(float(target_edge.scale), 1.0)
+    target_center = (
+        (_center(target_edge.first_bbox)[0] + _center(target_edge.second_bbox)[0]) / 2.0,
+        (_center(target_edge.first_bbox)[1] + _center(target_edge.second_bbox)[1]) / 2.0,
+    )
+
+    neighbor_gaps: list[float] = []
+    for edge in sorted(
+        all_edges, key=lambda item: (item.first_entity_id, item.second_entity_id)
+    ):
+        edge_pair = frozenset((edge.first_entity_id, edge.second_entity_id))
+        if edge_pair == target_pair:
+            continue
+        if (
+            edge.first_entity_id not in valid_group_entity_ids
+            or edge.second_entity_id not in valid_group_entity_ids
+        ):
+            continue
+
+        edge_horizontal = edge.same_row_band and not edge.same_column_band
+        edge_vertical = edge.same_column_band and not edge.same_row_band
+        if edge_horizontal != target_horizontal or edge_vertical != target_vertical:
+            continue
+
+        edge_center = (
+            (_center(edge.first_bbox)[0] + _center(edge.second_bbox)[0]) / 2.0,
+            (_center(edge.first_bbox)[1] + _center(edge.second_bbox)[1]) / 2.0,
+        )
+        if hypot(
+            target_center[0] - edge_center[0],
+            target_center[1] - edge_center[1],
+        ) > 3.0 * scale:
+            continue
+
+        if target_horizontal:
+            gap = max(
+                0.0,
+                max(edge.first_bbox[1], edge.second_bbox[1])
+                - min(edge.first_bbox[3], edge.second_bbox[3]),
+            )
+        else:
+            gap = max(
+                0.0,
+                max(edge.first_bbox[0], edge.second_bbox[0])
+                - min(edge.first_bbox[2], edge.second_bbox[2]),
+            )
+        neighbor_gaps.append(gap)
+
+    if not neighbor_gaps:
+        return None
+
+    mean_gap = float(np.mean(neighbor_gaps))
+    std_gap = float(np.std(neighbor_gaps))
+    return mean_gap, std_gap
+
+
+def _adaptive_composition_gap(
+    first: V21CanonicalEntity,
+    second: V21CanonicalEntity,
+    edge: V21LinkedPairEvidence,
+    local_context: Optional[Tuple[float, float]],
+) -> bool:
+    """Validate composition gap using local evidence, with a scale-relative fallback."""
+    if edge.same_row_band and not edge.same_column_band:
+        gap = max(
+            0.0,
+            max(first.canonical_bbox[1], second.canonical_bbox[1])
+            - min(first.canonical_bbox[3], second.canonical_bbox[3]),
+        )
+        ref_dim = max(
+            min(_height(first.canonical_bbox), _height(second.canonical_bbox)),
+            1.0,
+        )
+    elif edge.same_column_band and not edge.same_row_band:
+        gap = max(
+            0.0,
+            max(first.canonical_bbox[0], second.canonical_bbox[0])
+            - min(first.canonical_bbox[2], second.canonical_bbox[2]),
+        )
+        ref_dim = max(
+            min(_width(first.canonical_bbox), _width(second.canonical_bbox)),
+            1.0,
+        )
+    else:
+        return False
+
+    if local_context is not None:
+        mean_gap, std_gap = local_context
+        local_limit = mean_gap + 2.0 * std_gap
+        # Keep the decision scale-relative when local whitespace is extremely small.
+        return gap / ref_dim <= max(local_limit / ref_dim, 0.5)
+
+    return gap / ref_dim <= 1.5
+
+
+def _feature_value(
+    entity: V21CanonicalEntity,
+    hypothesis: V21SubregionHypothesis,
+    group: V21HypothesisGroup,
+    spatial: V21SpatialRepresentation,
+    by_id: dict[str, V21CanonicalEntity],
+    field_type: str,
+    contact_entity_ids: set[str],
+) -> dict[str, float]:
+    group_box = _union_box_for_entity_ids(group.entity_ids, by_id)
+    group_width = max(_width(group_box), 1.0)
+    group_height = max(_height(group_box), 1.0)
+    group_center = _center(group_box)
+    entity_box = entity.canonical_bbox
+    entity_center = _center(entity_box)
+    read_order = tuple(spatial.read_order)
+    total_read = max(len(read_order), 1)
+    read_index = (
+        read_order.index(entity.canonical_id)
+        if entity.canonical_id in read_order
+        else None
+    )
+    read_centrality = (
+        1.0
+        if read_index is None
+        else 1.0
+        - min(
+            abs(read_index - (total_read - 1) / 2.0) / max((total_read - 1) / 2.0, 1.0),
+            1.0,
+        )
+    )
+    prominence = _clamp(_height(entity_box) / max(group_height, 1.0))
+    relative_height = _clamp(_height(entity_box) / max(group_height, 1.0))
+    column_alignment = _clamp(
+        1.0 - abs(entity_center[0] - group_center[0]) / max(group_width / 2.0, 1.0)
+    )
+    row_centrality = _clamp(
+        1.0 - abs(entity_center[1] - group_center[1]) / max(group_height / 2.0, 1.0)
+    )
+    horizontal_alignment = column_alignment
+    compactness = _clamp(
+        1.0
+        / (
+            1.0
+            + abs(_width(entity_box) - _height(entity_box))
+            / max(_width(entity_box) + _height(entity_box), 1.0)
+        )
+    )
+    span_width = _clamp(_width(entity_box) / max(group_width, 1.0))
+    group_density = _clamp(len(group.entity_ids) / max(len(hypothesis.groups), 1))
+    region_prominence = _clamp(_height(entity_box) / max(_height(group_box), 1.0))
+    nearest_contact = _NEUTRAL_FEATURE_VALUE
+    if contact_entity_ids:
+        contact_centers = [
+            _center(by_id[contact_id].canonical_bbox)
+            for contact_id in contact_entity_ids
+            if contact_id in by_id
+        ]
+        if contact_centers:
+            distances = [
+                hypot(entity_center[0] - center[0], entity_center[1] - center[1])
+                for center in contact_centers
+            ]
+            nearest_contact = _clamp(
+                1.0 - min(distances) / max(group_width + group_height, 1.0)
+            )
+    candidate_features = {
+        "prominence": prominence,
+        "read_centrality": read_centrality,
+        "column_alignment": column_alignment,
+        "compactness": compactness,
+        "relative_height": relative_height,
+        "row_centrality": row_centrality,
+        "horizontal_alignment": horizontal_alignment,
+        "span_width": span_width,
+        "group_density": group_density,
+        "region_prominence": region_prominence,
+        "contact_anchor": nearest_contact,
+    }
+    if field_type not in _FIELD_WEIGHTS:
+        return {name: _NEUTRAL_FEATURE_VALUE for name, _ in _FIELD_WEIGHTS["NAME"]}
+    return {
+        name: candidate_features.get(name, _NEUTRAL_FEATURE_VALUE)
+        for name, _ in _FIELD_WEIGHTS[field_type]
+    }
+
+
+def _edge_id(first_id: str, second_id: str) -> str:
+    return "|".join(sorted((first_id, second_id)))
+
+
+def _composition_allowed(
+    hypothesis: V21SubregionHypothesis,
+    group: V21HypothesisGroup,
+    first: V21CanonicalEntity,
+    second: V21CanonicalEntity,
+    edge: V21LinkedPairEvidence,
+    spatial: V21SpatialRepresentation,
+    by_id: dict[str, V21CanonicalEntity],
+    contact_entity_ids: set[str],
+    all_edges: Tuple[V21LinkedPairEvidence, ...] = (),
+) -> bool:
+    if hypothesis.hypothesis_id == "":
+        return False
+    if group.group_id not in {item.group_id for item in hypothesis.groups}:
+        return False
+    if not edge.linked:
+        return False
+    if (
+        first.canonical_id not in group.entity_ids
+        or second.canonical_id not in group.entity_ids
+    ):
+        return False
+    if edge.first_entity_id not in (first.canonical_id, second.canonical_id):
+        return False
+    if edge.second_entity_id not in (first.canonical_id, second.canonical_id):
+        return False
+
+    local_context = (
+        _compute_local_edge_context(
+            edge, all_edges, hypothesis, by_id
+        )
+        if all_edges
+        else None
+    )
+    if not _adaptive_composition_gap(first, second, edge, local_context):
+        return False
+
+    relevant = [
+        by_id[entity_id]
+        for entity_id in group.entity_ids
+        if entity_id not in (first.canonical_id, second.canonical_id)
+    ]
+    first_center = _center(first.canonical_bbox)
+    second_center = _center(second.canonical_bbox)
+    if edge.same_row_band and not edge.same_column_band:
+        min_x = min(first.canonical_bbox[0], second.canonical_bbox[0])
+        max_x = max(first.canonical_bbox[2], second.canonical_bbox[2])
+        for entity in relevant:
+            box = entity.canonical_bbox
+            if box[0] <= max_x and box[2] >= min_x:
+                if (
+                    min(first_center[1], second_center[1])
+                    <= _center(box)[1]
+                    <= max(first_center[1], second_center[1])
+                ):
+                    return False
+        if contact_entity_ids.intersection(
+            {entity.canonical_id for entity in relevant}
+        ):
+            return False
+        return True
+    if edge.same_column_band and not edge.same_row_band:
+        min_y = min(first.canonical_bbox[1], second.canonical_bbox[1])
+        max_y = max(first.canonical_bbox[3], second.canonical_bbox[3])
+        for entity in relevant:
+            box = entity.canonical_bbox
+            if box[1] <= max_y and box[3] >= min_y:
+                if (
+                    min(first_center[0], second_center[0])
+                    <= _center(box)[0]
+                    <= max(first_center[0], second_center[0])
+                ):
+                    return False
+        if contact_entity_ids.intersection(
+            {entity.canonical_id for entity in relevant}
+        ):
+            return False
+        return True
+    return False
+
+
+def _identity_composite_candidates(
+    hypothesis: V21SubregionHypothesis,
+    group: V21HypothesisGroup,
+    spatial: V21SpatialRepresentation,
+    by_id: dict[str, V21CanonicalEntity],
+    evidence: V21SpatialEvidence,
+    candidates: Tuple[V21ContactCandidate, ...],
+    field_weights: dict[str, Tuple[Tuple[str, float], ...]],
+    existing_atomic: dict[tuple[str, str], V21IdentityCandidate],
+) -> list[V21IdentityCandidate]:
+    typed = []
+    contact_entity_ids = {
+        entity_id
+        for candidate in candidates
+        for entity_id in candidate.source_canonical_entity_ids
+        if entity_id in by_id
+    }
+    edges_by_pair = {
+        tuple(sorted((item.first_entity_id, item.second_entity_id))): item
+        for item in evidence.linked_pair_evidence
+    }
+    entity_ids = tuple(sorted(group.entity_ids))
+
+    # 1. Pairwise Compositions (Length = 2)
+    valid_pairs: list[tuple[str, str, V21LinkedPairEvidence]] = []
+    for left_index, left_id in enumerate(entity_ids):
+        first = by_id[left_id]
+        for right_id in entity_ids[left_index + 1 :]:
+            second = by_id[right_id]
+            pair = tuple(sorted((left_id, right_id)))
+            edge = edges_by_pair.get(pair)
+            if edge is None:
+                continue
+            if not _composition_allowed(
+                hypothesis,
+                group,
+                first,
+                second,
+                edge,
+                spatial,
+                by_id,
+                contact_entity_ids,
+                evidence.linked_pair_evidence,
+            ):
+                continue
+            valid_pairs.append((left_id, right_id, edge))
+
+            read_order_ids = [item for item in spatial.read_order if item in pair]
+            if not read_order_ids:
+                continue
+
+            for field_type in _FIELD_PRIORITY:
+                first_atomic = existing_atomic.get((field_type, first.canonical_id))
+                second_atomic = existing_atomic.get((field_type, second.canonical_id))
+                if first_atomic is None or second_atomic is None:
+                    continue
+                text = " ".join(
+                    item
+                    for item in (
+                        first.representative_text.strip(),
+                        second.representative_text.strip(),
+                    )
+                    if item
+                )
+                if not text:
+                    continue
+                row_ids = tuple(
+                    sorted(
+                        {
+                            row_id
+                            for entity_id in pair
+                            for row_id in _entity_row_and_column_ids(
+                                spatial, entity_id
+                            )[0]
+                        }
+                    )
+                )
+                column_ids = tuple(
+                    sorted(
+                        {
+                            column_id
+                            for entity_id in pair
+                            for column_id in _entity_row_and_column_ids(
+                                spatial, entity_id
+                            )[1]
+                        }
+                    )
+                )
+                composite_id = f"{hypothesis.hypothesis_id}-{group.group_id}-{field_type}-composite-{_edge_id(left_id, right_id)}"
+                raw_features = tuple(
+                    (name, float(value))
+                    for name, value in _feature_value(
+                        first,
+                        hypothesis,
+                        group,
+                        spatial,
+                        by_id,
+                        field_type,
+                        contact_entity_ids,
+                    ).items()
+                )
+                raw_features = tuple(
+                    sorted(raw_features, key=lambda item: item[0])
+                )
+                normalized_features = tuple(
+                    (name, float(_clamp(value, 0.0, 1.0)))
+                    for name, value in raw_features
+                )
+                weights = tuple(
+                    (name, float(weight)) for name, weight in field_weights[field_type]
+                )
+                score = round(
+                    sum(
+                        weight * norm
+                        for (name, weight), (_, norm) in zip(
+                            weights, normalized_features
+                        )
+                    ),
+                    6,
+                )
+                typed.append(
+                    V21IdentityCandidate(
+                        candidate_id=composite_id,
+                        field_type=field_type,
+                        text=text,
+                        composition_type=(
+                            "HORIZONTAL" if edge.same_row_band else "VERTICAL"
+                        ),
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        group_id=group.group_id,
+                        region_id=hypothesis.region_id,
+                        source_entity_ids=pair,
+                        row_ids=row_ids,
+                        column_ids=column_ids,
+                        source_candidate_ids=(
+                            first_atomic.candidate_id,
+                            second_atomic.candidate_id,
+                        ),
+                        source_edge_ids=(
+                            _edge_id(first.canonical_id, second.canonical_id),
+                        ),
+                        raw_features=raw_features,
+                        normalized_features=normalized_features,
+                        weights=weights,
+                        score=score,
+                    )
+                )
+
+    # 2. Triplet Compositions (Length = 3)
+    for i, (e1_a, e1_b, edge1) in enumerate(valid_pairs):
+        for e2_a, e2_b, edge2 in valid_pairs[i + 1 :]:
+            triplet_entities = sorted(list(set([e1_a, e1_b, e2_a, e2_b])))
+            if len(triplet_entities) != 3:
+                continue
+
+            ordered_triplet = [
+                entity_id for entity_id in spatial.read_order if entity_id in triplet_entities
+            ]
+            if len(ordered_triplet) != 3:
+                continue
+
+            # The two graph edges must be the two adjacent links in read order.
+            required_edges = {
+                frozenset((ordered_triplet[0], ordered_triplet[1])),
+                frozenset((ordered_triplet[1], ordered_triplet[2])),
+            }
+            actual_edges = {
+                frozenset((e1_a, e1_b)),
+                frozenset((e2_a, e2_b)),
+            }
+            if actual_edges != required_edges:
+                continue
+            if edge1.same_row_band != edge2.same_row_band:
+                continue
+
+            edge1_ok = _composition_allowed(
+                hypothesis,
+                group,
+                by_id[e1_a],
+                by_id[e1_b],
+                edge1,
+                spatial,
+                by_id,
+                contact_entity_ids,
+                evidence.linked_pair_evidence,
+            )
+            edge2_ok = _composition_allowed(
+                hypothesis,
+                group,
+                by_id[e2_a],
+                by_id[e2_b],
+                edge2,
+                spatial,
+                by_id,
+                contact_entity_ids,
+                evidence.linked_pair_evidence,
+            )
+            if not (edge1_ok and edge2_ok):
+                continue
+
+            for field_type in _FIELD_PRIORITY:
+                atomics = [existing_atomic.get((field_type, e)) for e in ordered_triplet]
+                if any(a is None for a in atomics):
+                    continue
+
+                text = " ".join(
+                    item
+                    for item in (by_id[e].representative_text.strip() for e in ordered_triplet)
+                    if item
+                )
+                if not text:
+                    continue
+
+                row_ids = tuple(
+                    sorted(
+                        {
+                            row_id
+                            for e in ordered_triplet
+                            for row_id in _entity_row_and_column_ids(spatial, e)[0]
+                        }
+                    )
+                )
+                column_ids = tuple(
+                    sorted(
+                        {
+                            column_id
+                            for e in ordered_triplet
+                            for column_id in _entity_row_and_column_ids(spatial, e)[1]
+                        }
+                    )
+                )
+
+                composite_id = (
+                    f"{hypothesis.hypothesis_id}-{group.group_id}-{field_type}-triplet-"
+                    f"{_edge_id(e1_a, e1_b)}-{_edge_id(e2_a, e2_b)}"
+                )
+                first_entity = by_id[ordered_triplet[0]]
+                raw_features = tuple(
+                    (name, float(value))
+                    for name, value in _feature_value(
+                        first_entity,
+                        hypothesis,
+                        group,
+                        spatial,
+                        by_id,
+                        field_type,
+                        contact_entity_ids,
+                    ).items()
+                )
+                raw_features = tuple(sorted(raw_features, key=lambda item: item[0]))
+                normalized_features = tuple(
+                    (name, float(_clamp(value, 0.0, 1.0)))
+                    for name, value in raw_features
+                )
+                weights = tuple(
+                    (name, float(weight)) for name, weight in field_weights[field_type]
+                )
+                score = round(
+                    sum(
+                        weight * norm
+                        for (name, weight), (_, norm) in zip(
+                            weights, normalized_features
+                        )
+                    ),
+                    6,
+                )
+
+                typed.append(
+                    V21IdentityCandidate(
+                        candidate_id=composite_id,
+                        field_type=field_type,
+                        text=text,
+                        composition_type=(
+                            "TRIPLET_HORIZONTAL" if edge1.same_row_band else "TRIPLET_VERTICAL"
+                        ),
+                        hypothesis_id=hypothesis.hypothesis_id,
+                        group_id=group.group_id,
+                        region_id=hypothesis.region_id,
+                        source_entity_ids=tuple(ordered_triplet),
+                        row_ids=row_ids,
+                        column_ids=column_ids,
+                        source_candidate_ids=tuple(a.candidate_id for a in atomics if a),
+                        source_edge_ids=(
+                            _edge_id(e1_a, e1_b),
+                            _edge_id(e2_a, e2_b),
+                        ),
+                        raw_features=raw_features,
+                        normalized_features=normalized_features,
+                        weights=weights,
+                        score=score,
+                    )
+                )
+
+    return typed
+
+
+def _identity_candidate_pool(
+    hypothesis: V21SubregionHypothesis,
+    spatial: V21SpatialRepresentation,
+    by_id: dict[str, V21CanonicalEntity],
+    evidence: V21SpatialEvidence,
+    candidates: Tuple[V21ContactCandidate, ...],
+) -> tuple[V21IdentityCandidate, ...]:
+    atomic_candidates: list[V21IdentityCandidate] = []
+    atomic_lookup: dict[tuple[str, str], V21IdentityCandidate] = {}
+    contact_entity_ids = {
+        entity_id
+        for candidate in candidates
+        for entity_id in candidate.source_canonical_entity_ids
+        if entity_id in by_id
+    }
+    for group in hypothesis.groups:
+        group_entities = [
+            by_id[entity_id] for entity_id in group.entity_ids if entity_id in by_id
+        ]
+        for entity in sorted(group_entities, key=lambda item: item.canonical_id):
+            row_ids, column_ids = _entity_row_and_column_ids(
+                spatial, entity.canonical_id
+            )
+            for field_type in _FIELD_PRIORITY:
+                feature_values = _feature_value(
+                    entity,
+                    hypothesis,
+                    group,
+                    spatial,
+                    by_id,
+                    field_type,
+                    contact_entity_ids,
+                )
+                weights = _FIELD_WEIGHTS[field_type]
+                raw_features = tuple(
+                    (name, float(value)) for name, value in feature_values.items()
+                )
+                raw_features = tuple(sorted(raw_features, key=lambda item: item[0]))
+                normalized_features = tuple(
+                    (name, float(_clamp(value, 0.0, 1.0)))
+                    for name, value in raw_features
+                )
+                score = round(
+                    sum(
+                        float(weight) * normalized
+                        for (feature_name, weight), (_, normalized) in zip(
+                            weights, normalized_features
+                        )
+                    ),
+                    6,
+                )
+                candidate_id = f"{hypothesis.hypothesis_id}-{group.group_id}-{field_type}-{entity.canonical_id}"
+                candidate = V21IdentityCandidate(
+                    candidate_id=candidate_id,
+                    field_type=field_type,
+                    text=entity.representative_text,
+                    composition_type="ATOMIC",
+                    hypothesis_id=hypothesis.hypothesis_id,
+                    group_id=group.group_id,
+                    region_id=hypothesis.region_id,
+                    source_entity_ids=(entity.canonical_id,),
+                    row_ids=row_ids,
+                    column_ids=column_ids,
+                    source_candidate_ids=(),
+                    source_edge_ids=(),
+                    raw_features=raw_features,
+                    normalized_features=normalized_features,
+                    weights=tuple((name, float(weight)) for name, weight in weights),
+                    score=score,
+                )
+                atomic_candidates.append(candidate)
+                atomic_lookup[(field_type, entity.canonical_id)] = candidate
+
+    composite_candidates: list[V21IdentityCandidate] = []
+    for group in hypothesis.groups:
+        composite_candidates.extend(
+            _identity_composite_candidates(
+                hypothesis,
+                group,
+                spatial,
+                by_id,
+                evidence,
+                candidates,
+                _FIELD_WEIGHTS,
+                atomic_lookup,
+            )
+        )
+    all_candidates = tuple(
+        sorted(
+            (*atomic_candidates, *composite_candidates),
+            key=lambda item: (
+                item.hypothesis_id,
+                item.group_id,
+                item.field_type,
+                item.candidate_id,
+            ),
+        )
+    )
+    return all_candidates
+
+
+def _candidate_binding_pool(
+    hypothesis: V21SubregionHypothesis,
+    candidates: Tuple[V21IdentityCandidate, ...],
+) -> dict[str, tuple[V21IdentityCandidate, ...]]:
+    grouped: dict[str, list[V21IdentityCandidate]] = {
+        field_type: [] for field_type in _FIELD_PRIORITY
+    }
+    for candidate in candidates:
+        if candidate.hypothesis_id != hypothesis.hypothesis_id:
+            continue
+        grouped.setdefault(candidate.field_type, []).append(candidate)
+    return {
+        field_type: tuple(
+            sorted(items, key=lambda item: (-item.score, item.candidate_id))
+        )
+        for field_type, items in grouped.items()
+    }
+
+
+def _binding_candidates_for_field(
+    field_type: str,
+    field_candidates: tuple[V21IdentityCandidate, ...],
+    used_candidate_ids: set[str],
+    used_entity_ids: set[str],
+) -> Optional[V21IdentityCandidate]:
+    for candidate in field_candidates:
+        if candidate.candidate_id in used_candidate_ids:
+            continue
+        if set(candidate.source_entity_ids).intersection(used_entity_ids):
+            continue
+        return candidate
+    return None
+
+
+def _resolve_binding(
+    hypothesis: V21SubregionHypothesis,
+    candidates: Tuple[V21IdentityCandidate, ...],
+) -> V21IdentityBinding:
+    field_candidates = _candidate_binding_pool(hypothesis, candidates)
+    used_candidates: set[str] = set()
+    used_entities: set[str] = set()
+    selected: dict[str, Optional[str]] = {
+        field_type: None for field_type in _FIELD_PRIORITY
+    }
+    for field_type in _FIELD_PRIORITY:
+        candidate = _binding_candidates_for_field(
+            field_type,
+            field_candidates.get(field_type, ()),
+            used_candidates,
+            used_entities,
+        )
+        if candidate is None:
+            continue
+        used_candidates.add(candidate.candidate_id)
+        used_entities.update(candidate.source_entity_ids)
+        selected[field_type] = candidate.candidate_id
+    return V21IdentityBinding(
+        hypothesis_id=hypothesis.hypothesis_id,
+        name_candidate_id=selected["NAME"],
+        title_candidate_id=selected["TITLE"],
+        company_candidate_id=selected["COMPANY"],
+    )
+
+
+def generate_identity_bindings(
+    reconciliation: V21ReconciliationResult,
+    spatial: V21SpatialRepresentation,
+    evidence: V21SpatialEvidence,
+    candidates: Tuple[V21ContactCandidate, ...],
+    hypotheses: V21SubregionHypothesisResult,
+) -> V21IdentityResult:
+    """Generate deterministic identity candidates and purely structural field bindings.
+
+    Phase 6 is intentionally additive: every hypothesis is evaluated independently,
+    without selecting a physical panel or mixing evidence across hypotheses.
+    """
+    by_id = {entity.canonical_id: entity for entity in reconciliation.entities}
+    all_candidates: list[V21IdentityCandidate] = []
+    for hypothesis in hypotheses.hypotheses:
+        scope_candidates = _identity_candidate_pool(
+            hypothesis,
+            spatial,
+            by_id,
+            evidence,
+            candidates,
+        )
+        all_candidates.extend(scope_candidates)
+    ordered_candidates = tuple(
+        sorted(
+            all_candidates,
+            key=lambda item: (
+                item.hypothesis_id,
+                item.group_id,
+                item.field_type,
+                item.candidate_id,
+            ),
+        )
+    )
+    bindings = tuple(
+        _resolve_binding(hypothesis, ordered_candidates)
+        for hypothesis in hypotheses.hypotheses
+    )
+    return V21IdentityResult(candidates=ordered_candidates, bindings=bindings)
+
+
+# ==============================================================================
+# PIPELINE EXECUTION & CLI
+# ==============================================================================
+
+
 def _result_mapping(result: Any) -> Any:
     if isinstance(result, dict):
         return result.get("res", result)
@@ -1515,8 +2406,16 @@ def main() -> None:
     for label, image in _images(args.target):
         pool = process_image(image, pool_id=Path(label).stem, lang=args.lang)
         reconciled, spatial = build_pipeline_representation(pool)
+        spatial_evidence = build_spatial_evidence(reconciled)
         candidates = extract_deterministic_candidates(reconciled, spatial)
         primacy = determine_panel_primacy(reconciled, spatial, candidates)
+        hypotheses = generate_subregion_hypotheses(
+            reconciled, spatial, spatial_evidence, candidates
+        )
+        identity_result = generate_identity_bindings(
+            reconciled, spatial, spatial_evidence, candidates, hypotheses
+        )
+
         if args.as_json:
             print(
                 json.dumps(
@@ -1526,6 +2425,7 @@ def main() -> None:
                 )
             )
             continue
+
         pass_1_count = len(pool.by_pass("pass_1"))
         pass_2_count = len(pool.by_pass("pass_2"))
         row_count = sum(len(region.rows) for region in spatial.regions)
@@ -1577,6 +2477,12 @@ def main() -> None:
                 f"contact={panel.contact_signal:.6f}"
             )
         print(f"    primary={primacy.primary_region_id}")
+        print("  identity bindings:")
+        for binding in identity_result.bindings:
+            print(f"    hypothesis={binding.hypothesis_id}")
+            print(f"      name={binding.name_candidate_id}")
+            print(f"      title={binding.title_candidate_id}")
+            print(f"      company={binding.company_candidate_id}")
 
 
 if __name__ == "__main__":
