@@ -293,12 +293,14 @@ class V21LinkedPairEvidence:
     close_y: bool
     same_row_band: bool
     same_column_band: bool
-    scale: float
+    scale: float  # Deprecated: kept for compatibility, equals h_unit
     first_bbox: BBox
     second_bbox: BBox
     vertical_overlap: float
     horizontal_overlap: float
     linked: bool
+    h_unit: float = 0.0
+    w_unit: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -352,7 +354,7 @@ def _union(entities: tuple[V21CanonicalEntity, ...]) -> BBox:
 
 
 def _linked_pair_evidence(
-    first: V21CanonicalEntity, second: V21CanonicalEntity, scale: float
+    first: V21CanonicalEntity, second: V21CanonicalEntity, h_unit: float, w_unit: float
 ) -> V21LinkedPairEvidence:
     first_box = first.canonical_bbox
     second_box = second.canonical_bbox
@@ -366,10 +368,10 @@ def _linked_pair_evidence(
     horizontal_overlap = min(first_box[2], second_box[2]) - max(
         first_box[0], second_box[0]
     )
-    close_x = dx <= max(_width(first_box), _width(second_box), scale) * 6.0
-    close_y = dy <= max(_height(first_box), _height(second_box), scale) * 6.0
-    same_row_band = vertical_overlap > 0.0 or dy <= scale * 1.5
-    same_column_band = horizontal_overlap > 0.0 or dx <= scale * 1.5
+    close_x = dx <= max(_width(first_box), _width(second_box), w_unit) * 6.0
+    close_y = dy <= max(_height(first_box), _height(second_box), h_unit) * 6.0
+    same_row_band = vertical_overlap > 0.0 or dy <= h_unit * 1.5
+    same_column_band = horizontal_overlap > 0.0 or dx <= w_unit * 1.5
     linked = (close_x and same_row_band) or (close_y and same_column_band)
     first_id, second_id = sorted((first.canonical_id, second.canonical_id))
     return V21LinkedPairEvidence(
@@ -377,23 +379,25 @@ def _linked_pair_evidence(
         second_entity_id=second_id,
         dx=dx,
         dy=dy,
-        normalized_dx=dx / scale if scale > 0.0 else 0.0,
-        normalized_dy=dy / scale if scale > 0.0 else 0.0,
+        normalized_dx=dx / w_unit if w_unit > 0.0 else 0.0,
+        normalized_dy=dy / h_unit if h_unit > 0.0 else 0.0,
         close_x=close_x,
         close_y=close_y,
         same_row_band=same_row_band,
         same_column_band=same_column_band,
-        scale=scale,
+        scale=h_unit,
         first_bbox=first_box,
         second_bbox=second_box,
         vertical_overlap=vertical_overlap,
         horizontal_overlap=horizontal_overlap,
         linked=linked,
+        h_unit=h_unit,
+        w_unit=w_unit,
     )
 
 
 def _region_linked(
-    first: V21CanonicalEntity, second: V21CanonicalEntity, scale: float
+    first: V21CanonicalEntity, second: V21CanonicalEntity, h_unit: float, w_unit: float
 ) -> bool:
     first_box = first.canonical_bbox
     second_box = second.canonical_bbox
@@ -407,10 +411,10 @@ def _region_linked(
     horizontal_overlap = min(first_box[2], second_box[2]) - max(
         first_box[0], second_box[0]
     )
-    close_x = dx <= max(_width(first_box), _width(second_box), scale) * 6.0
-    close_y = dy <= max(_height(first_box), _height(second_box), scale) * 6.0
-    same_row_band = vertical_overlap > 0.0 or dy <= scale * 1.5
-    same_column_band = horizontal_overlap > 0.0 or dx <= scale * 1.5
+    close_x = dx <= max(_width(first_box), _width(second_box), w_unit) * 6.0
+    close_y = dy <= max(_height(first_box), _height(second_box), h_unit) * 6.0
+    same_row_band = vertical_overlap > 0.0 or dy <= h_unit * 1.5
+    same_column_band = horizontal_overlap > 0.0 or dx <= w_unit * 1.5
     return (close_x and same_row_band) or (close_y and same_column_band)
 
 
@@ -419,17 +423,13 @@ def _region_linkage_graph(
 ) -> tuple[dict[str, set[str]], tuple[V21LinkedPairEvidence, ...]]:
     if not entities:
         return {}, ()
-    scale = median(
-        [
-            max(_width(item.canonical_bbox), _height(item.canonical_bbox))
-            for item in entities
-        ]
-    )
+    h_unit = median([_height(item.canonical_bbox) for item in entities])
+    w_unit = median([_width(item.canonical_bbox) for item in entities])
     adjacency = {item.canonical_id: set() for item in entities}
     evidence: list[V21LinkedPairEvidence] = []
     for index, first in enumerate(entities):
         for second in entities[index + 1 :]:
-            pair_evidence = _linked_pair_evidence(first, second, scale)
+            pair_evidence = _linked_pair_evidence(first, second, h_unit, w_unit)
             evidence.append(pair_evidence)
             if pair_evidence.linked:
                 adjacency[first.canonical_id].add(second.canonical_id)
